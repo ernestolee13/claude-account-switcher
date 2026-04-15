@@ -13,7 +13,12 @@ ERROR_TYPE=$(echo "$INPUT" | jq -r '.error_type // empty' 2>/dev/null || true)
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null || true)
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null || true)
 
-[ "$ERROR_TYPE" != "rate_limit" ] && exit 0
+LOG_FILE="$HOME/.claude/logs/account-switch.log"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"; }
+
+[ "$ERROR_TYPE" != "rate_limit" ] && { log "StopFailure hook: error_type=$ERROR_TYPE (ignored)"; exit 0; }
+
+log "=== Rate limit detected ==="
 
 # --- Config ---
 COOLDOWN="${CLAUDE_SWITCH_COOLDOWN:-1800}"
@@ -30,6 +35,9 @@ NOW=$(date +%s)
 
 notify() {
   osascript -e "display notification \"$1\" with title \"$2\"" 2>/dev/null || true
+  # cmux display-message (if cmux is available)
+  local cmux_bin="${CMUX_BUNDLED_CLI_PATH:-/Applications/cmux.app/Contents/Resources/bin/cmux}"
+  [ -x "$cmux_bin" ] && "$cmux_bin" display-message "$1" 2>/dev/null || true
 }
 
 save_current_credentials() {
@@ -113,9 +121,12 @@ else
   if swap_credentials "$OTHER"; then
     echo "$OTHER" > "$STATE_FILE"
     rm -f "/tmp/claude_ratelimit_account${OTHER}"
-    notify "Switched to account${OTHER}. Resuming in tmux..." "Claude Code"
+    log "Switched: account${CURRENT} → account${OTHER} | Keychain swapped | statsig cleared"
+    notify "Rate limit hit. Switched account${CURRENT}→${OTHER}. Continue: tmux attach -t claude-failover" "Claude Code Account Switcher"
     start_resume_session "claude-failover"
+    log "tmux session 'claude-failover' created"
   else
+    log "FAILED: account${OTHER} credentials not found"
     notify "Account${OTHER} credentials not found. Run: claude-save-accounts.sh ${OTHER}" "Claude Code"
   fi
 fi

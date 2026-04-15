@@ -14,11 +14,17 @@ SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null || true)
 [ -z "$TRANSCRIPT" ] && exit 0
 [ ! -f "$TRANSCRIPT" ] && exit 0
 
+LOG_FILE="$HOME/.claude/logs/account-switch.log"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"; }
+
 # Check last few lines of transcript for rate_limit error
 LAST_LINES=$(tail -5 "$TRANSCRIPT" 2>/dev/null)
 if echo "$LAST_LINES" | grep -q '"error".*"rate_limit"' 2>/dev/null; then
-  # Rate limit detected — pass to main handler
+  log "Stop hook: rate_limit detected in transcript | session=$SESSION_ID"
   echo "{\"error_type\":\"rate_limit\",\"cwd\":\"${CWD}\",\"session_id\":\"${SESSION_ID}\"}" | bash ~/.claude/scripts/on-ratelimit.sh
+else
+  # Normal stop — no action (no logging to avoid noise)
+  :
 fi
 
 exit 0
