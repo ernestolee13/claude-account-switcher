@@ -8,7 +8,8 @@ When one account hits the rate limit, automatically switches to another — no m
 
 ```
 Session hits rate limit
-  → StopFailure hook fires
+  → Claude Code fires StopFailure event (API error only, not user Esc/Ctrl+C)
+  → Hook matches on error_type: "rate_limit"
   → Switches active account (state file)
   → macOS notification
   → Opens tmux session with the other account
@@ -18,6 +19,8 @@ Both accounts exhausted?
   → Waits in background
   → Auto-opens session on recovery + notification
 ```
+
+**Note:** The `StopFailure` hook only fires on API errors (rate limit, auth failure, server error). It does NOT fire on user abort (Esc, Ctrl+C) or normal exit (`/exit`, Ctrl+D). This means the hook won't interfere with normal usage.
 
 ## Prerequisites
 
