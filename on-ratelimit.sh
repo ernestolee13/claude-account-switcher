@@ -19,6 +19,7 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"; }
 [ "$ERROR_TYPE" != "rate_limit" ] && { log "StopFailure hook: error_type=$ERROR_TYPE (ignored)"; exit 0; }
 
 log "=== Rate limit detected ==="
+log "Env: CMUX_WORKSPACE_ID=${CMUX_WORKSPACE_ID:-none} | TMUX=${TMUX:-none}"
 
 # --- Config ---
 COOLDOWN="${CLAUDE_SWITCH_COOLDOWN:-1800}"
@@ -60,10 +61,27 @@ swap_credentials() {
 
 start_resume_session() {
   local name="$1"
-  command -v "$TMUX_BIN" >/dev/null 2>&1 || return 0
-  "$TMUX_BIN" kill-session -t "$name" 2>/dev/null || true
-  "$TMUX_BIN" new-session -d -s "$name" -c "${CWD:-$HOME}" \
-    "claude -r"
+
+  # Prefer cmux if available and CMUX_WORKSPACE_ID is set (from parent session)
+  local cmux_bin="${CMUX_BUNDLED_CLI_PATH:-/Applications/cmux.app/Contents/Resources/bin/cmux}"
+  if [ -x "$cmux_bin" ] && [ -n "${CMUX_WORKSPACE_ID:-}" ]; then
+    # Create split in current workspace, then send claude -r command
+    local split_result
+    split_result=$("$cmux_bin" new-split right --workspace "$CMUX_WORKSPACE_ID" 2>&1 || true)
+    local new_surface
+    new_surface=$(echo "$split_result" | grep -oE "surface:[0-9]+" | head -1)
+    if [ -n "$new_surface" ]; then
+      "$cmux_bin" send --surface "$new_surface" "cd ${CWD:-$HOME} && claude -r" 2>/dev/null || true
+      log "cmux split created: $new_surface with 'claude -r'"
+      return 0
+    fi
+  fi
+
+  # Fallback: tmux
+  if command -v "$TMUX_BIN" >/dev/null 2>&1; then
+    "$TMUX_BIN" kill-session -t "$name" 2>/dev/null || true
+    "$TMUX_BIN" new-session -d -s "$name" -c "${CWD:-$HOME}" "claude -r"
+  fi
 }
 
 # Record rate limit
