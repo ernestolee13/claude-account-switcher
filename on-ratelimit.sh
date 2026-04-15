@@ -45,6 +45,9 @@ swap_credentials() {
 
   security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" 2>/dev/null || true
   security add-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w "$(cat "$cred_file")" 2>/dev/null
+
+  # Clear statsig cache to prevent rate limit carryover bug (#12786)
+  [ -d "$CRED_DIR/statsig" ] && rm -rf "$CRED_DIR/statsig" 2>/dev/null || true
 }
 
 start_resume_session() {
