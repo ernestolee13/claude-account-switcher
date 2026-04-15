@@ -2,31 +2,32 @@
 
 Automatic account failover for Claude Code Max plan users with multiple subscriptions.
 
-When one account hits the rate limit, automatically switches to another — no manual intervention needed. If both accounts are exhausted, waits for recovery and auto-resumes.
+When one account hits the rate limit, automatically swaps credentials and resumes your work in a new session. If both accounts are exhausted, waits for recovery and auto-resumes.
 
 ## How it works
 
 ```
 Session hits rate limit
-  → Claude Code fires StopFailure event (API error only, not user Esc/Ctrl+C)
-  → Hook matches on error_type: "rate_limit"
-  → Switches active account (state file)
+  → StopFailure hook fires (API errors only, not Esc/Ctrl+C)
+  → Saves current account's OAuth token from Keychain
+  → Swaps in the other account's token
+  → Opens new tmux session with `claude -r` (resume last session)
   → macOS notification
-  → Opens tmux session with the other account
 
 Both accounts exhausted?
-  → Calculates which recovers first
-  → Waits in background
-  → Auto-opens session on recovery + notification
+  → Picks whichever recovers first
+  → Background waiter sleeps until recovery
+  → Swaps credentials + opens resume session + notification
 ```
 
-**Note:** The `StopFailure` hook only fires on API errors (rate limit, auth failure, server error). It does NOT fire on user abort (Esc, Ctrl+C) or normal exit (`/exit`, Ctrl+D). This means the hook won't interfere with normal usage.
+**Key difference from other tools:** Existing tools ([claude-swap](https://github.com/realiti4/claude-swap), [claudini](https://github.com/kimrgrey/claudini), [cc-account-switcher](https://github.com/ming86/cc-account-switcher)) all require manual switching. This is the first to use Claude Code's `StopFailure` hook for automatic detection + credential swap + session resume.
 
 ## Prerequisites
 
+- macOS (uses Keychain for credential storage)
 - [Claude Code](https://claude.ai/code) with 2 Max plan accounts
 - `jq` — `brew install jq`
-- `tmux` (optional but recommended) — `brew install tmux`
+- `tmux` — `brew install tmux`
 
 ## Install
 
@@ -37,124 +38,129 @@ bash install.sh
 ```
 
 The installer:
-1. Copies hook script to `~/.claude/scripts/`
+1. Copies hook script + save script to `~/.claude/scripts/`
 2. Registers `StopFailure` hook in `~/.claude/settings.json`
 3. Adds `cc` / `cc2` aliases to your shell
 4. Checks account login status
 
 ## Account setup
 
-After install, log in to each account:
+### Step 1: Save your current account
 
 ```bash
-# Account 1 — uses default ~/.claude (your current login)
-# Already logged in if you use Claude Code normally
-
-# Account 2 — uses separate config directory
-CLAUDE_CONFIG_DIR=~/.claude-account2 claude login
-# → Browser opens, log in with your second account
+# Currently logged in as account 1
+bash ~/.claude/scripts/claude-save-accounts.sh 1
 ```
 
-**Important:** Each account must have its own `CLAUDE_CONFIG_DIR`. Do NOT use `claude logout` + `claude login` to switch — this shares the same `~/.claude/statsig/` directory and [may cause rate limits to carry over between accounts](https://github.com/anthropics/claude-code/issues/12786).
+### Step 2: Log in to second account and save
+
+```bash
+# In Claude Code session, switch to second account
+/login
+# → Browser opens, log in with second account
+
+# Save it
+bash ~/.claude/scripts/claude-save-accounts.sh 2
+```
+
+### Step 3: Switch back to primary account
+
+```bash
+/login
+# → Browser opens, log in with primary account
+```
+
+That's it. Both accounts' OAuth tokens are now backed up. The hook will swap between them automatically.
 
 ## Usage
 
+Just use Claude Code normally. When rate limit hits:
+
+1. Hook fires automatically
+2. Credentials swapped in Keychain
+3. New tmux session opens with `claude -r` (resumes last session)
+4. macOS notification tells you what happened
+
 ```bash
-cc          # Start Claude with account 1 (default)
-cc2         # Start Claude with account 2
+# Attach to the failover session
+tmux attach -t claude-failover
+
+# Or after both-exhausted recovery
+tmux attach -t claude-resume
 ```
-
-That's it. Everything else is automatic:
-
-- **Rate limit on one account** → Switches to the other, opens tmux session
-- **Both accounts exhausted** → Waits ~30min, auto-resumes with whichever recovers first
-- **macOS notification** on every switch and recovery
 
 ### Schedule a command for recovery
 
-If both accounts are down and you want something to run automatically when they recover:
+If both accounts are down and you want something to run when they recover:
 
 ```bash
 echo 'bash ~/my-batch-script.sh' > /tmp/claude_resume_command
 ```
 
-The hook will execute this command instead of opening a tmux session.
+## How it works (technical)
 
-### Attach to failover session
+Claude Code stores OAuth credentials in macOS Keychain under `Claude Code-credentials`. The hook:
 
-When the hook switches accounts, it opens a tmux session:
+1. Reads the current token from Keychain and saves it to `~/.claude/credentials-account{N}.json`
+2. Writes the other account's saved token into Keychain
+3. Opens `claude -r` in tmux — Claude Code reads the new token from Keychain on startup
 
-```bash
-tmux attach -t claude-failover   # after single-account switch
-tmux attach -t claude-resume     # after both-exhausted recovery
-```
-
-## How accounts are isolated
-
-Claude Code stores credentials in macOS Keychain, keyed by a hash of the config directory path. Setting `CLAUDE_CONFIG_DIR` creates a fully independent credential store:
-
-```
-~/.claude/                → account 1 credentials + statsig
-~/.claude-account2/       → account 2 credentials + statsig (independent)
-```
-
-This avoids the [rate limit carryover bug (#12786)](https://github.com/anthropics/claude-code/issues/12786) where `logout/login` on the same `~/.claude` directory causes the new account to inherit the old account's rate limit state.
-
-## About the rate limit carryover bug
-
-GitHub issue [#12786](https://github.com/anthropics/claude-code/issues/12786) reports that switching accounts via `claude logout` → `claude login` (same directory) can cause the new account to be immediately rate-limited. The suspected cause is `~/.claude/statsig/` retaining device-level rate limit tracking.
-
-**Current status:** This bug may not affect all users. Some report switching via `/login` within a session works fine. The `CLAUDE_CONFIG_DIR` isolation approach works regardless — it's a safe default that avoids the issue entirely.
-
-If `/login` switching works for you, you may not need this tool. This tool is most useful when:
-- You want **automatic** switching (no manual `/login`)
-- You run **batch scripts** (`claude -p`) that need unattended failover
-- You want **both-exhausted recovery** with auto-resume
+This is the same mechanism as `/login` — just automated. Session history stays in `~/.claude/` so `claude -r` can resume.
 
 ## Files
 
-| File | Location | Purpose |
-|------|----------|---------|
-| `on-ratelimit.sh` | `~/.claude/scripts/` | StopFailure hook — account switch + resume logic |
-| `settings.json` | `~/.claude/` | Hook registration (added by installer) |
-| Shell aliases | `~/.zshrc` or `~/.bashrc` | `cc`, `cc2` shortcuts |
+| File | Purpose |
+|------|---------|
+| `on-ratelimit.sh` | StopFailure hook — credential swap + tmux resume |
+| `claude-save-accounts.sh` | Backup current Keychain credentials to file |
+| `install.sh` | One-command setup |
 
-### Runtime state files (in `/tmp/`, cleared on reboot)
+### Runtime state (in `/tmp/`, cleared on reboot)
 
 | File | Purpose |
 |------|---------|
-| `claude_active_account` | Current active account number (1 or 2) |
-| `claude_ratelimit_account1` | Timestamp when account 1 hit rate limit |
-| `claude_ratelimit_account2` | Timestamp when account 2 hit rate limit |
+| `claude_active_account` | Current active account (1 or 2) |
+| `claude_ratelimit_account{1,2}` | Timestamp when each account hit rate limit |
 | `claude_resume_command` | Optional command to run on recovery |
-| `claude_resume_pid` | PID of background resume waiter (prevents duplicates) |
+| `claude_resume_pid` | Background waiter PID (prevents duplicates) |
+
+### Credential backups (in `~/.claude/`, gitignored)
+
+| File | Purpose |
+|------|---------|
+| `credentials-account1.json` | Account 1 OAuth token backup |
+| `credentials-account2.json` | Account 2 OAuth token backup |
 
 ## Configuration
 
-Edit the top of `on-ratelimit.sh` to customize:
+Environment variables or edit `on-ratelimit.sh`:
 
-```bash
-ACCOUNT2_DIR="${CLAUDE_ACCOUNT2_DIR:-$HOME/.claude-account2}"  # account 2 config path
-COOLDOWN=1800          # seconds to assume rate limit lasts (default: 30 min)
-TMUX="${TMUX_BIN:-/opt/homebrew/bin/tmux}"  # tmux binary path
-```
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLAUDE_SWITCH_COOLDOWN` | `1800` | Seconds to assume rate limit lasts (30 min) |
+| `TMUX_BIN` | `/opt/homebrew/bin/tmux` | Path to tmux binary |
 
-Or set environment variables: `CLAUDE_ACCOUNT2_DIR`, `TMUX_BIN`.
+## About the rate limit carryover bug
+
+[GitHub #12786](https://github.com/anthropics/claude-code/issues/12786) reports that switching accounts via `logout/login` can cause the new account to inherit the old account's rate limit. This may be caused by device-level tracking in `~/.claude/statsig/`.
+
+**In practice, many users (including the author) have not experienced this bug.** The `/login` approach works fine for most. If you do encounter it, the `CLAUDE_CONFIG_DIR` isolation approach (separate config directories per account) is a known workaround.
+
+## Limitations
+
+- **macOS only** — relies on Keychain. Linux/Windows would need credential file swap instead.
+- **StopFailure hook** was added in Claude Code v2.1.78 (March 2026). Older versions won't work.
+- **Cooldown estimate** (30 min) is approximate. Actual rate limit reset time varies.
+- **New session required** — the hook can't refresh credentials in a running session. It opens a new `claude -r` session in tmux instead.
 
 ## Uninstall
 
 ```bash
-# Remove hook script
 rm ~/.claude/scripts/on-ratelimit.sh
-
-# Remove hook from settings.json (edit manually — remove the "hooks" section)
-
-# Remove aliases from ~/.zshrc (remove the "Claude Code multi-account" lines)
-
-# Remove account 2 config
-rm -rf ~/.claude-account2
-
-# Clean up state files
+rm ~/.claude/scripts/claude-save-accounts.sh
+rm ~/.claude/credentials-account*.json
+# Edit ~/.claude/settings.json — remove the "hooks" section
+# Edit ~/.zshrc — remove "Claude Code multi-account" lines
 rm -f /tmp/claude_active_account /tmp/claude_ratelimit_account* /tmp/claude_resume_*
 ```
 

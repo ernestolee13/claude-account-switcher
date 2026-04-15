@@ -1,0 +1,4 @@
+credentials-account*.json
+.omc/
+.DS_Store
+*.swp
