@@ -76,6 +76,9 @@ start_resume_session() {
   if command -v "$TMUX_BIN" >/dev/null 2>&1; then
     "$TMUX_BIN" kill-session -t "$name" 2>/dev/null || true
     "$TMUX_BIN" new-session -d -s "$name" -c "${CWD:-$HOME}" "$resume_cmd"
+  else
+    log "No cmux or tmux available. Resume manually: cd \"${CWD:-$HOME}\" && $resume_cmd"
+    notify "Rate limit switched. Run manually: $resume_cmd" "Claude Code"
   fi
 }
 
