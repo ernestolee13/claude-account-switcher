@@ -41,6 +41,30 @@ bash install.sh
 
 The installer detects OS, registers both hooks, and adds aliases to `.zshrc` or `.bashrc`.
 
+### Customizing paths and alias names
+
+Set env vars before running `install.sh`:
+
+```bash
+# Custom config dir for account 2
+ACCOUNT2_DIR=~/.claude-work bash install.sh
+
+# Custom alias names
+ALIAS_1=cpersonal ALIAS_2=cwork bash install.sh
+
+# Combine
+ACCOUNT2_DIR=~/.claude-work ALIAS_1=home ALIAS_2=work bash install.sh
+```
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `ACCOUNT2_DIR` | `~/.claude-account2` | Path for second config dir |
+| `ALIAS_1` | `cc` | Alias for account 1 (auto-derives `cc` + `ccr`) |
+| `ALIAS_2` | `cc2` | Alias for account 2 (auto-derives `cc2` + `cc2r`) |
+| `USAGE_ALIAS` | `claude-usage` | Alias for the usage viewer |
+
+The installer patches the installed hook script so that `ACCOUNT2_DIR` is baked in — you don't need to export it in every shell.
+
 ## Account setup
 
 ### Local machine (macOS or Linux desktop)

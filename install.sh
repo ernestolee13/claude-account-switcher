@@ -1,13 +1,30 @@
 #!/bin/bash
 # Claude Account Switcher — Installer (macOS + Linux)
 # Usage: bash install.sh
+#
+# Customize via env vars (before running):
+#   ACCOUNT2_DIR=~/.claude-work  bash install.sh
+#   ALIAS_1=cpersonal ALIAS_2=cwork  bash install.sh
+#
+# Env vars:
+#   ACCOUNT2_DIR  — path for second config dir (default: ~/.claude-account2)
+#   ALIAS_1       — alias name for account 1 (default: cc)
+#   ALIAS_2       — alias name for account 2 (default: cc2)
+#   USAGE_ALIAS   — alias name for usage viewer (default: claude-usage)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CLAUDE_SCRIPTS="$HOME/.claude/scripts"
 CLAUDE_SETTINGS="$HOME/.claude/settings.json"
-CONFIG_DIR_2="$HOME/.claude-account2"
+
+# Customizable
+ACCOUNT2_DIR="${ACCOUNT2_DIR:-$HOME/.claude-account2}"
+ALIAS_1="${ALIAS_1:-cc}"
+ALIAS_2="${ALIAS_2:-cc2}"
+USAGE_ALIAS="${USAGE_ALIAS:-claude-usage}"
+ALIAS_1R="${ALIAS_1}r"
+ALIAS_2R="${ALIAS_2}r"
 
 # Detect OS
 OS="unknown"
@@ -16,7 +33,6 @@ case "$(uname -s)" in
   Linux)  OS="linux" ;;
 esac
 
-# Distro-appropriate install hint
 install_hint() {
   local pkg="$1"
   if [ "$OS" = "macos" ]; then
@@ -33,7 +49,9 @@ install_hint() {
 }
 
 echo "=== Claude Account Switcher — Install ==="
-echo "Detected OS: $OS"
+echo "  OS:            $OS"
+echo "  Account 2 dir: $ACCOUNT2_DIR"
+echo "  Aliases:       $ALIAS_1 / $ALIAS_1R / $ALIAS_2 / $ALIAS_2R / $USAGE_ALIAS"
 echo ""
 
 # 1. Check prerequisites
@@ -47,30 +65,37 @@ if ! command -v tmux >/dev/null 2>&1; then
   echo "           Install with: $(install_hint tmux)"
 fi
 
-echo "  claude: $(claude --version 2>/dev/null | head -1)"
-echo "  jq: $(jq --version 2>/dev/null)"
+echo "  claude:  $(claude --version 2>/dev/null | head -1)"
+echo "  jq:      $(jq --version 2>/dev/null)"
 echo "  python3: $(python3 --version 2>/dev/null)"
-command -v tmux >/dev/null 2>&1 && echo "  tmux: $(tmux -V 2>/dev/null)"
+command -v tmux >/dev/null 2>&1 && echo "  tmux:    $(tmux -V 2>/dev/null)"
 
-# 2. Copy scripts
+# 2. Copy scripts and patch ACCOUNT2_DIR if customized
 echo ""
-echo "[2/5] Installing scripts..."
+echo "[2/5] Installing scripts to $CLAUDE_SCRIPTS..."
 mkdir -p "$CLAUDE_SCRIPTS"
 cp "$SCRIPT_DIR/on-ratelimit.sh" "$CLAUDE_SCRIPTS/on-ratelimit.sh"
 cp "$SCRIPT_DIR/on-stop-ratelimit.sh" "$CLAUDE_SCRIPTS/on-stop-ratelimit.sh"
 cp "$SCRIPT_DIR/claude-usage.sh" "$CLAUDE_SCRIPTS/claude-usage.sh"
+
+# If custom ACCOUNT2_DIR, patch scripts so hook doesn't rely on shell env
+if [ "$ACCOUNT2_DIR" != "$HOME/.claude-account2" ]; then
+  # Escape for sed
+  ESC_DIR=$(printf '%s\n' "$ACCOUNT2_DIR" | sed 's/[\/&]/\\&/g')
+  sed -i.bak "s|\$HOME/.claude-account2|$ESC_DIR|g" "$CLAUDE_SCRIPTS/on-ratelimit.sh" "$CLAUDE_SCRIPTS/claude-usage.sh"
+  rm -f "$CLAUDE_SCRIPTS"/*.bak
+  echo "  Patched scripts with ACCOUNT2_DIR=$ACCOUNT2_DIR"
+fi
+
 chmod +x "$CLAUDE_SCRIPTS/on-ratelimit.sh" "$CLAUDE_SCRIPTS/on-stop-ratelimit.sh" "$CLAUDE_SCRIPTS/claude-usage.sh"
-echo "  Installed to $CLAUDE_SCRIPTS/"
+echo "  Done"
 
 # 3. Register hooks in settings.json
 echo ""
 echo "[3/5] Registering hooks..."
-if [ ! -f "$CLAUDE_SETTINGS" ]; then
-  echo '{}' > "$CLAUDE_SETTINGS"
-fi
+[ -f "$CLAUDE_SETTINGS" ] || echo '{}' > "$CLAUDE_SETTINGS"
 
 TMPFILE=$(mktemp)
-
 if ! jq -e '.hooks.StopFailure' "$CLAUDE_SETTINGS" >/dev/null 2>&1; then
   jq '.hooks.StopFailure = [{"matcher": "rate_limit", "hooks": [{"type": "command", "command": "bash ~/.claude/scripts/on-ratelimit.sh"}]}]' "$CLAUDE_SETTINGS" > "$TMPFILE"
   mv "$TMPFILE" "$CLAUDE_SETTINGS"
@@ -88,7 +113,7 @@ else
   echo "  Stop hook already exists — skipping"
 fi
 
-# 4. Setup shell aliases (detect shell from $SHELL or file existence)
+# 4. Setup shell aliases
 echo ""
 echo "[4/5] Setting up shell aliases..."
 SHELL_RC=""
@@ -102,60 +127,58 @@ case "${SHELL:-}" in
     ;;
 esac
 
-if grep -q "Claude Code multi-account" "$SHELL_RC" 2>/dev/null; then
-  echo "  Aliases already exist in $SHELL_RC — skipping"
+MARKER="# Claude Account Switcher"
+if grep -q "$MARKER" "$SHELL_RC" 2>/dev/null; then
+  echo "  Aliases marker already present in $SHELL_RC — skipping"
+  echo "  (Remove existing block manually to regenerate)"
 else
-  cat >> "$SHELL_RC" << 'ALIASES'
+  # Use double-quoted heredoc so env var customizations expand
+  cat >> "$SHELL_RC" << ALIASES
 
-# Claude Code multi-account (CLAUDE_CONFIG_DIR creates separate credential storage)
-alias cc="claude"
-alias cc2="CLAUDE_CONFIG_DIR=~/.claude-account2 claude"
-alias ccr="claude --dangerously-skip-permissions"
-alias cc2r="CLAUDE_CONFIG_DIR=~/.claude-account2 claude --dangerously-skip-permissions"
-alias claude-usage="bash ~/.claude/scripts/claude-usage.sh"
+$MARKER — CLAUDE_CONFIG_DIR creates separate credential storage
+alias $ALIAS_1="claude"
+alias $ALIAS_2="CLAUDE_CONFIG_DIR=$ACCOUNT2_DIR claude"
+alias $ALIAS_1R="claude --dangerously-skip-permissions"
+alias $ALIAS_2R="CLAUDE_CONFIG_DIR=$ACCOUNT2_DIR claude --dangerously-skip-permissions"
+alias $USAGE_ALIAS="CLAUDE_CONFIG_DIR_2=$ACCOUNT2_DIR bash ~/.claude/scripts/claude-usage.sh"
 ALIASES
-  echo "  Added cc, cc2, ccr, cc2r, claude-usage aliases to $SHELL_RC"
+  echo "  Added aliases to $SHELL_RC:"
+  echo "    $ALIAS_1, $ALIAS_2, $ALIAS_1R, $ALIAS_2R, $USAGE_ALIAS"
 fi
 
 # 5. Create second config dir
 echo ""
-echo "[5/5] Account setup..."
-mkdir -p "$CONFIG_DIR_2"
+echo "[5/5] Creating second config dir: $ACCOUNT2_DIR"
+mkdir -p "$ACCOUNT2_DIR"
 
 echo ""
 echo "=== Installation complete ==="
 echo ""
 echo "NEXT: Login each account (one time per config dir)"
 echo ""
-if [ "$OS" = "linux" ] && [ -z "${DISPLAY:-}" ] && [ -z "${SSH_CONNECTION:-}" ]; then
-  echo "  Account 1 (default):"
-  echo "    claude login"
+if [ "$OS" = "linux" ] && [ -n "${SSH_CONNECTION:-}" ] && [ -z "${DISPLAY:-}" ]; then
+  echo "  Headless server detected."
   echo ""
-  echo "  Account 2 (separate config):"
-  echo "    CLAUDE_CONFIG_DIR=~/.claude-account2 claude login"
-  echo ""
-elif [ "$OS" = "linux" ]; then
-  echo "  Headless server?"
-  echo "  Option A — Login on local machine, then copy credentials to server:"
+  echo "  Option A — Copy credentials from local machine:"
   echo "    # on local machine (after claude login):"
   echo "    scp ~/.claude/.credentials.json server:~/.claude/.credentials.json"
-  echo "    scp ~/.claude-account2/.credentials.json server:~/.claude-account2/.credentials.json"
+  echo "    scp ~/.claude-account2/.credentials.json server:$ACCOUNT2_DIR/.credentials.json"
   echo ""
-  echo "  Option B — Use SSH port forwarding for OAuth browser flow:"
-  echo "    ssh -L 54545:localhost:54545 server   # adjust port if needed"
+  echo "  Option B — SSH port forwarding for browser OAuth:"
+  echo "    ssh -L 54545:localhost:54545 server"
   echo "    # then on server: claude login"
   echo ""
 else
   echo "  Account 1:  claude login"
-  echo "  Account 2:  CLAUDE_CONFIG_DIR=~/.claude-account2 claude login"
+  echo "  Account 2:  CLAUDE_CONFIG_DIR=$ACCOUNT2_DIR claude login"
   echo ""
 fi
 
 echo "Usage:"
-echo "  cc   / ccr    — account 1 (with/without permission prompts)"
-echo "  cc2  / cc2r   — account 2"
-echo "  claude-usage  — show both accounts' usage"
+echo "  $ALIAS_1 / $ALIAS_1R   — account 1 (with/without permission prompts)"
+echo "  $ALIAS_2 / $ALIAS_2R   — account 2"
+echo "  $USAGE_ALIAS           — show both accounts' usage"
 echo ""
-echo "Rate limit handling is automatic — no action needed."
+echo "Rate limit handling is automatic."
 echo ""
-echo "Restart your shell to activate: source $SHELL_RC"
+echo "Restart your shell: source $SHELL_RC"
