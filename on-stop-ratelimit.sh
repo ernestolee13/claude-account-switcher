@@ -3,6 +3,9 @@
 # Stop fires on every turn end. We check the transcript for rate limit markers.
 # If found, delegate to on-ratelimit.sh logic.
 
+# Clear cmux NODE_OPTIONS to prevent temp file errors in child processes
+unset NODE_OPTIONS 2>/dev/null || true
+
 INPUT=$(cat)
 
 # Stop hook receives: session_id, transcript_path, cwd, stop_reason, etc.

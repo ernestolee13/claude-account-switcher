@@ -12,6 +12,9 @@
 #
 # Requires: jq
 
+# Clear cmux NODE_OPTIONS to prevent temp file errors in child processes
+unset NODE_OPTIONS 2>/dev/null || true
+
 INPUT=$(cat)
 ERROR_TYPE=$(echo "$INPUT" | jq -r '.error_type // empty' 2>/dev/null || true)
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null || true)
