@@ -32,7 +32,13 @@ except: print('?')
 import json,sys
 d=json.load(sys.stdin)
 if 'error' in d:
-    print(f\"  {'$label':<20} {'$email':<30} auth error (재로그인 필요)\")
+    err_type=d['error'].get('type','unknown')
+    if 'auth' in err_type:
+        print(f\"  {'$label':<20} {'$email':<30} 재로그인 필요 ({err_type})\")
+    elif 'rate_limit' in err_type:
+        print(f\"  {'$label':<20} {'$email':<30} API rate limit — 잠시 후 재시도\")
+    else:
+        print(f\"  {'$label':<20} {'$email':<30} 에러: {err_type}\")
 else:
     h5=d['five_hour']['utilization']
     d7=d['seven_day']['utilization']
