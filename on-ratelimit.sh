@@ -70,6 +70,11 @@ start_resume_session() {
     if [ -n "$new_surface" ]; then
       "$cmux_bin" send --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "cd \"${CWD:-$HOME}\" && ${resume_cmd}" 2>/dev/null || true
       "$cmux_bin" send-key --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "enter" 2>/dev/null || true
+      # After session loads, send continue message
+      ( sleep 10 && \
+        "$cmux_bin" send --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "Rate limit으로 계정이 전환되었습니다. 이전 작업을 이어서 진행해주세요." 2>/dev/null && \
+        "$cmux_bin" send-key --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "enter" 2>/dev/null \
+      ) &
       log "cmux tab created: $new_surface with account${OTHER} (config: $target_config)"
       return 0
     fi
