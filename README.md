@@ -120,22 +120,25 @@ If both accounts are down and you want something to run when they recover:
 echo 'bash ~/my-batch-script.sh' > /tmp/claude_resume_command
 ```
 
-## Sharing state between accounts (optional)
+## Shared state between accounts
 
-For seamless work continuation, symlink shared resources so both accounts see the same sessions, plugins, and settings:
+The installer automatically symlinks these from `~/.claude` into the second config dir so both accounts share them:
 
-```bash
-cd ~/.claude-account2
-rm -rf sessions projects plugins CLAUDE.md settings.json scripts
-ln -s ~/.claude/sessions sessions           # session history (for -r resume)
-ln -s ~/.claude/projects projects           # project transcripts
-ln -s ~/.claude/plugins plugins             # installed plugins
-ln -s ~/.claude/CLAUDE.md CLAUDE.md         # global instructions
-ln -s ~/.claude/settings.json settings.json # hooks, env, status line
-ln -s ~/.claude/scripts scripts             # hook scripts
-```
+| Symlink | Purpose |
+|---------|---------|
+| `sessions/` | **Required** — session history for cross-account `-r <session_id>` |
+| `projects/` | **Required** — conversation transcripts |
+| `settings.json` | Shared hooks (so rate-limit hook fires for both) |
+| `scripts/` | Hook scripts — the actual switcher code |
+| `plugins/` | Shared plugins (OMC, etc.) |
+| `CLAUDE.md` | Global instructions |
 
-This lets the switcher resume the same session on either account, since transcripts and settings are shared. Account-specific data (`.claude.json`, credentials, `statsig/`) stays separate automatically.
+Account-specific data stays **separate** automatically:
+- `.claude.json` (cached account metadata)
+- Credentials (Keychain entry on macOS / `.credentials.json` on Linux)
+- `statsig/` (device tracking)
+
+If an existing file/dir exists at the symlink target, the installer leaves it alone — rerun-safe.
 
 ## How config dir isolation works
 

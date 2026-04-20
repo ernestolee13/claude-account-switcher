@@ -146,10 +146,52 @@ ALIASES
   echo "    $ALIAS_1, $ALIAS_2, $ALIAS_1R, $ALIAS_2R, $USAGE_ALIAS"
 fi
 
-# 5. Create second config dir
+# 5. Create second config dir + symlink shared resources
 echo ""
-echo "[5/5] Creating second config dir: $ACCOUNT2_DIR"
+echo "[5/5] Setting up second config dir: $ACCOUNT2_DIR"
+
+if [ ! -d "$HOME/.claude" ]; then
+  echo "  WARNING: ~/.claude not found. Run 'claude' at least once before logging in to account 2."
+fi
+
 mkdir -p "$ACCOUNT2_DIR"
+
+# Symlink shared resources so both accounts see the same session history,
+# hook config, plugins, and global instructions. Required for seamless
+# cross-account session resume (-r <session_id>).
+# Only creates symlink if target doesn't exist yet (preserves existing setup).
+link_shared() {
+  local name="$1"
+  local src="$HOME/.claude/$name"
+  local dst="$ACCOUNT2_DIR/$name"
+
+  # Source must exist
+  [ ! -e "$src" ] && { echo "  skip $name (source not found)"; return; }
+
+  # If destination exists as real dir/file (not symlink), leave it alone
+  if [ -e "$dst" ] && [ ! -L "$dst" ]; then
+    echo "  skip $name (exists in $ACCOUNT2_DIR, not overwriting)"
+    return
+  fi
+
+  # If already a symlink to the right target, skip
+  if [ -L "$dst" ]; then
+    local current=$(readlink "$dst")
+    [ "$current" = "$src" ] && { echo "  skip $name (already linked)"; return; }
+    rm -f "$dst"
+  fi
+
+  ln -s "$src" "$dst"
+  echo "  linked $name"
+}
+
+echo "  Creating symlinks for shared state..."
+link_shared "sessions"      # REQUIRED: -r <session_id> lookup
+link_shared "projects"      # REQUIRED: transcripts
+link_shared "plugins"       # shared plugins (OMC, etc.)
+link_shared "settings.json" # shared hooks and config
+link_shared "scripts"       # hook scripts
+link_shared "CLAUDE.md"     # global instructions (optional)
 
 echo ""
 echo "=== Installation complete ==="
