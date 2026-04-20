@@ -2,12 +2,15 @@
 # Claude Code Account Switcher — StopFailure Hook
 # On rate limit: open new session with alternate CLAUDE_CONFIG_DIR
 #
-# Claude Code automatically creates separate Keychain entries per config dir
-# (e.g., "Claude Code-credentials-33351ebb" for ~/.claude-account2)
-# so NO manual Keychain manipulation is needed.
+# Claude Code automatically isolates credentials per config dir:
+#   - macOS: separate Keychain entries ("Claude Code-credentials-<hash>")
+#   - Linux: separate ~/.claude[-account2]/.credentials.json files
+# so NO manual credential manipulation is needed.
 #
 # Setup:
-#   1. Login once with each config dir: cc → /login (account1), cc2 → /login (account2)
+#   1. Login once per config dir:
+#        claude login
+#        CLAUDE_CONFIG_DIR=~/.claude-account2 claude login
 #   2. Register this hook in ~/.claude/settings.json
 #
 # Requires: jq
@@ -21,6 +24,7 @@ CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null || true)
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null || true)
 
 LOG_FILE="$HOME/.claude/logs/account-switch.log"
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"; }
 
 [ "$ERROR_TYPE" != "rate_limit" ] && { log "StopFailure hook: error_type=$ERROR_TYPE (ignored)"; exit 0; }
@@ -31,9 +35,12 @@ log "Env: CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-default} | CMUX_WORKSPACE_ID=${
 # --- Config ---
 COOLDOWN="${CLAUDE_SWITCH_COOLDOWN:-1800}"
 CONFIG_DIR_1="$HOME/.claude"
-CONFIG_DIR_2="$HOME/.claude-account2"
+CONFIG_DIR_2="${CLAUDE_CONFIG_DIR_2:-$HOME/.claude-account2}"
 STATE_FILE="/tmp/claude_active_account"
-TMUX_BIN="${TMUX_BIN:-/opt/homebrew/bin/tmux}"
+# Auto-detect tmux binary (macOS homebrew, Linux system path, etc.)
+TMUX_BIN="${TMUX_BIN:-$(command -v tmux 2>/dev/null || echo '')}"
+# Resume message (override via env)
+RESUME_MESSAGE="${CLAUDE_RESUME_MESSAGE:-Rate limit으로 계정이 전환되었습니다. 이전 작업을 이어서 진행해주세요.}"
 # ---
 
 # Detect current account from CLAUDE_CONFIG_DIR
@@ -49,16 +56,34 @@ get_config_dir() {
   [ "$1" = "2" ] && echo "$CONFIG_DIR_2" || echo "$CONFIG_DIR_1"
 }
 
+# Cross-platform desktop notification (macOS/Linux). Silent if neither tool exists.
 notify() {
-  osascript -e "display notification \"$1\" with title \"$2\"" 2>/dev/null || true
+  local msg="$1" title="$2"
+  # macOS
+  if command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"$msg\" with title \"$title\"" 2>/dev/null || true
+  fi
+  # Linux (libnotify)
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send "$title" "$msg" 2>/dev/null || true
+  fi
+  # cmux (if available)
   local cmux_bin="${CMUX_BUNDLED_CLI_PATH:-/Applications/cmux.app/Contents/Resources/bin/cmux}"
-  [ -x "$cmux_bin" ] && "$cmux_bin" display-message "$1" 2>/dev/null || true
+  [ -x "$cmux_bin" ] && "$cmux_bin" display-message "$msg" 2>/dev/null || true
 }
 
 start_resume_session() {
   local name="$1"
   local target_config=$(get_config_dir "$OTHER")
-  local resume_cmd="CLAUDE_CONFIG_DIR=$target_config claude --dangerously-skip-permissions -r $SESSION_ID"
+
+  # Write resume script to avoid command garbling in send-to-tty cases
+  local script="/tmp/claude-resume-$$.sh"
+  cat > "$script" << RESUME_EOF
+#!/bin/bash
+cd "${CWD:-$HOME}"
+CLAUDE_CONFIG_DIR=$target_config claude --dangerously-skip-permissions -r $SESSION_ID
+RESUME_EOF
+  chmod +x "$script"
 
   # Prefer cmux if available and CMUX_WORKSPACE_ID is set
   local cmux_bin="${CMUX_BUNDLED_CLI_PATH:-/Applications/cmux.app/Contents/Resources/bin/cmux}"
@@ -68,15 +93,6 @@ start_resume_session() {
     local new_surface
     new_surface=$(echo "$new_result" | grep -oE "surface:[0-9]+" | head -1)
     if [ -n "$new_surface" ]; then
-      # Write resume script to avoid long command garbling in cmux send
-      local script="/tmp/claude-resume-$$.sh"
-      cat > "$script" << RESUME_EOF
-#!/bin/bash
-cd "${CWD:-$HOME}"
-CLAUDE_CONFIG_DIR=$target_config claude --dangerously-skip-permissions -r $SESSION_ID
-RESUME_EOF
-      chmod +x "$script"
-
       # Wait for shell init, dismiss any prompts, then run script
       sleep 2
       "$cmux_bin" send-key --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "enter" 2>/dev/null || true
@@ -85,22 +101,29 @@ RESUME_EOF
       "$cmux_bin" send-key --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "enter" 2>/dev/null || true
       # After session loads, send continue message
       ( sleep 15 && \
-        "$cmux_bin" send --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "Rate limit으로 계정이 전환되었습니다. 이전 작업을 이어서 진행해주세요." 2>/dev/null && \
+        "$cmux_bin" send --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "$RESUME_MESSAGE" 2>/dev/null && \
         "$cmux_bin" send-key --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "enter" 2>/dev/null \
       ) &
-      log "cmux tab created: $new_surface with account${OTHER} (config: $target_config) via $script"
+      log "cmux tab created: $new_surface with account${OTHER} via $script"
       return 0
     fi
   fi
 
   # Fallback: tmux
-  if command -v "$TMUX_BIN" >/dev/null 2>&1; then
+  if [ -n "$TMUX_BIN" ] && [ -x "$TMUX_BIN" ]; then
     "$TMUX_BIN" kill-session -t "$name" 2>/dev/null || true
-    "$TMUX_BIN" new-session -d -s "$name" -c "${CWD:-$HOME}" "$resume_cmd"
-  else
-    log "No cmux or tmux available. Resume manually: cd \"${CWD:-$HOME}\" && $resume_cmd"
-    notify "Rate limit switched. Run manually: $resume_cmd" "Claude Code"
+    "$TMUX_BIN" new-session -d -s "$name" -c "${CWD:-$HOME}" "bash $script"
+    # Send continue message after resume loads
+    ( sleep 15 && \
+      "$TMUX_BIN" send-keys -t "$name" "$RESUME_MESSAGE" Enter 2>/dev/null \
+    ) &
+    log "tmux session '$name' created with account${OTHER} via $script"
+    return 0
   fi
+
+  # Last resort: log manual instructions
+  log "No cmux or tmux available. Resume manually: bash $script"
+  notify "Rate limit switched to account${OTHER}. Run manually: bash $script" "Claude Code"
 }
 
 # Record rate limit
@@ -139,10 +162,16 @@ if [ "$SINCE_OTHER" -lt "$COOLDOWN" ]; then
     if [ -n \"\$RESUME_CMD\" ]; then
       eval \"\$RESUME_CMD\"
       rm -f /tmp/claude_resume_command
-    else
-      $TMUX_BIN kill-session -t claude-resume 2>/dev/null || true
-      $TMUX_BIN new-session -d -s claude-resume -c '${CWD:-$HOME}' 'CLAUDE_CONFIG_DIR=$RECOVER_CONFIG claude --dangerously-skip-permissions -r $SESSION_ID'
+    elif [ -n '$TMUX_BIN' ] && [ -x '$TMUX_BIN' ]; then
+      '$TMUX_BIN' kill-session -t claude-resume 2>/dev/null || true
+      '$TMUX_BIN' new-session -d -s claude-resume -c '${CWD:-$HOME}' 'CLAUDE_CONFIG_DIR=$RECOVER_CONFIG claude --dangerously-skip-permissions -r $SESSION_ID'
+    fi
+    # Notify (cross-platform)
+    if command -v osascript >/dev/null 2>&1; then
       osascript -e 'display notification \"Recovered (account${RECOVER_ACCT}). tmux attach -t claude-resume\" with title \"Claude Code\"' 2>/dev/null || true
+    fi
+    if command -v notify-send >/dev/null 2>&1; then
+      notify-send 'Claude Code' 'Recovered (account${RECOVER_ACCT}). tmux attach -t claude-resume' 2>/dev/null || true
     fi
     rm -f /tmp/claude_resume_pid
   " >/dev/null 2>&1 &
