@@ -70,6 +70,32 @@ echo "  jq:      $(jq --version 2>/dev/null)"
 echo "  python3: $(python3 --version 2>/dev/null)"
 command -v tmux >/dev/null 2>&1 && echo "  tmux:    $(tmux -V 2>/dev/null)"
 
+# First-time check: if ~/.claude doesn't exist, Claude Code was never run
+if [ ! -d "$HOME/.claude" ]; then
+  echo ""
+  echo "  NOTICE: ~/.claude not found. Claude Code has never been run."
+  echo "          Run 'claude' once (and login) before completing setup."
+  echo "          You can still proceed — ~/.claude will be created on first login."
+fi
+
+# Detect existing setup — warn if accounts already share an email (possible misconfig)
+ACCT1_EMAIL=""
+ACCT2_EMAIL=""
+if [ -f "$HOME/.claude/.claude.json" ]; then
+  ACCT1_EMAIL=$(jq -r '.oauthAccount.emailAddress // empty' "$HOME/.claude/.claude.json" 2>/dev/null)
+fi
+if [ -f "$ACCOUNT2_DIR/.claude.json" ]; then
+  ACCT2_EMAIL=$(jq -r '.oauthAccount.emailAddress // empty' "$ACCOUNT2_DIR/.claude.json" 2>/dev/null)
+fi
+if [ -n "$ACCT1_EMAIL" ] && [ "$ACCT1_EMAIL" = "$ACCT2_EMAIL" ]; then
+  echo ""
+  echo "  WARNING: Both config dirs appear to have the same account ($ACCT1_EMAIL)."
+  echo "           Rate limit failover only helps when the two accounts are different."
+  echo "           Consider logging out of one and logging in with a different account:"
+  echo "             CLAUDE_CONFIG_DIR=$ACCOUNT2_DIR claude logout"
+  echo "             CLAUDE_CONFIG_DIR=$ACCOUNT2_DIR claude login"
+fi
+
 # 2. Copy scripts and patch ACCOUNT2_DIR if customized
 echo ""
 echo "[2/5] Installing scripts to $CLAUDE_SCRIPTS..."
