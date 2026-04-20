@@ -68,14 +68,27 @@ start_resume_session() {
     local new_surface
     new_surface=$(echo "$new_result" | grep -oE "surface:[0-9]+" | head -1)
     if [ -n "$new_surface" ]; then
-      "$cmux_bin" send --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "cd \"${CWD:-$HOME}\" && ${resume_cmd}" 2>/dev/null || true
+      # Write resume script to avoid long command garbling in cmux send
+      local script="/tmp/claude-resume-$$.sh"
+      cat > "$script" << RESUME_EOF
+#!/bin/bash
+cd "${CWD:-$HOME}"
+CLAUDE_CONFIG_DIR=$target_config claude --dangerously-skip-permissions -r $SESSION_ID
+RESUME_EOF
+      chmod +x "$script"
+
+      # Wait for shell init, dismiss any prompts, then run script
+      sleep 2
+      "$cmux_bin" send-key --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "enter" 2>/dev/null || true
+      sleep 1
+      "$cmux_bin" send --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "bash $script" 2>/dev/null || true
       "$cmux_bin" send-key --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "enter" 2>/dev/null || true
       # After session loads, send continue message
-      ( sleep 10 && \
+      ( sleep 15 && \
         "$cmux_bin" send --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "Rate limit으로 계정이 전환되었습니다. 이전 작업을 이어서 진행해주세요." 2>/dev/null && \
         "$cmux_bin" send-key --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "enter" 2>/dev/null \
       ) &
-      log "cmux tab created: $new_surface with account${OTHER} (config: $target_config)"
+      log "cmux tab created: $new_surface with account${OTHER} (config: $target_config) via $script"
       return 0
     fi
   fi
