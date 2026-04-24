@@ -166,9 +166,17 @@ This means each config dir has fully independent authentication — no token fil
 |------|---------|
 | `claude_active_account` | Current active account (1 or 2) |
 | `claude_ratelimit_account{1,2}` | Timestamp when each account hit rate limit |
+| `claude_ratelimit_seen_uuids` | Dedup — UUIDs of rate-limit events already processed |
 | `claude_resume_command` | Optional command to run on recovery |
 | `claude_resume_pid` | Background waiter PID |
 | `claude-resume-<pid>.sh` | Temp script for resume command |
+
+### Debug logs (in `~/.claude/logs/`)
+
+| File | Purpose |
+|------|---------|
+| `account-switch.log` | Hook decisions + state changes |
+| `account-switch-payloads.log` | Raw hook inputs (rotated at 1MB) |
 
 ## Configuration
 

@@ -60,7 +60,9 @@ query_account() {
   local label="$1" config_dir="$2"
   local email token usage
 
-  email=$(cat "$config_dir/.claude.json" 2>/dev/null | python3 -c "
+  local profile_file="$config_dir/.claude.json"
+  [ ! -f "$profile_file" ] && [ -f "$HOME/.claude.json" ] && profile_file="$HOME/.claude.json"
+  email=$(cat "$profile_file" 2>/dev/null | python3 -c "
 import json,sys
 try: print(json.load(sys.stdin).get('oauthAccount',{}).get('emailAddress','?'))
 except: print('?')
