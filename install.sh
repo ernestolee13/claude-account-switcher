@@ -20,9 +20,11 @@ CLAUDE_SETTINGS="$HOME/.claude/settings.json"
 
 # Customizable
 ACCOUNT2_DIR="${ACCOUNT2_DIR:-$HOME/.claude-account2}"
-ALIAS_1="${ALIAS_1:-cc}"
-ALIAS_2="${ALIAS_2:-cc2}"
+ALIAS_AUTO="${ALIAS_AUTO:-cc}"     # auto-pick less-utilized account
+ALIAS_1="${ALIAS_1:-cc1}"          # explicit account 1
+ALIAS_2="${ALIAS_2:-cc2}"          # explicit account 2
 USAGE_ALIAS="${USAGE_ALIAS:-claude-usage}"
+ALIAS_AUTO_R="${ALIAS_AUTO}r"
 ALIAS_1R="${ALIAS_1}r"
 ALIAS_2R="${ALIAS_2}r"
 
@@ -103,17 +105,21 @@ mkdir -p "$CLAUDE_SCRIPTS"
 cp "$SCRIPT_DIR/on-ratelimit.sh" "$CLAUDE_SCRIPTS/on-ratelimit.sh"
 cp "$SCRIPT_DIR/on-stop-ratelimit.sh" "$CLAUDE_SCRIPTS/on-stop-ratelimit.sh"
 cp "$SCRIPT_DIR/claude-usage.sh" "$CLAUDE_SCRIPTS/claude-usage.sh"
+cp "$SCRIPT_DIR/pick-account.sh" "$CLAUDE_SCRIPTS/pick-account.sh"
 
 # If custom ACCOUNT2_DIR, patch scripts so hook doesn't rely on shell env
 if [ "$ACCOUNT2_DIR" != "$HOME/.claude-account2" ]; then
-  # Escape for sed
   ESC_DIR=$(printf '%s\n' "$ACCOUNT2_DIR" | sed 's/[\/&]/\\&/g')
-  sed -i.bak "s|\$HOME/.claude-account2|$ESC_DIR|g" "$CLAUDE_SCRIPTS/on-ratelimit.sh" "$CLAUDE_SCRIPTS/claude-usage.sh"
+  sed -i.bak "s|\$HOME/.claude-account2|$ESC_DIR|g" \
+    "$CLAUDE_SCRIPTS/on-ratelimit.sh" \
+    "$CLAUDE_SCRIPTS/claude-usage.sh" \
+    "$CLAUDE_SCRIPTS/pick-account.sh"
   rm -f "$CLAUDE_SCRIPTS"/*.bak
   echo "  Patched scripts with ACCOUNT2_DIR=$ACCOUNT2_DIR"
 fi
 
-chmod +x "$CLAUDE_SCRIPTS/on-ratelimit.sh" "$CLAUDE_SCRIPTS/on-stop-ratelimit.sh" "$CLAUDE_SCRIPTS/claude-usage.sh"
+chmod +x "$CLAUDE_SCRIPTS/on-ratelimit.sh" "$CLAUDE_SCRIPTS/on-stop-ratelimit.sh" \
+         "$CLAUDE_SCRIPTS/claude-usage.sh" "$CLAUDE_SCRIPTS/pick-account.sh"
 echo "  Done"
 
 # 3. Register hooks in settings.json
@@ -158,18 +164,55 @@ if grep -q "$MARKER" "$SHELL_RC" 2>/dev/null; then
   echo "  Aliases marker already present in $SHELL_RC — skipping"
   echo "  (Remove existing block manually to regenerate)"
 else
-  # Use double-quoted heredoc so env var customizations expand
+  # Heredoc with no quoting around delimiter so env vars expand
   cat >> "$SHELL_RC" << ALIASES
 
-$MARKER — CLAUDE_CONFIG_DIR creates separate credential storage
-alias $ALIAS_1="claude"
-alias $ALIAS_2="CLAUDE_CONFIG_DIR=$ACCOUNT2_DIR claude"
-alias $ALIAS_1R="claude --dangerously-skip-permissions"
-alias $ALIAS_2R="CLAUDE_CONFIG_DIR=$ACCOUNT2_DIR claude --dangerously-skip-permissions"
+$MARKER — tmux session per project, windows per account
+# - Inside tmux: new window in the CURRENT session
+# - Outside tmux: session name = \$CLAUDE_TMUX_SESSION or basename of cwd
+# - acct="auto": query usage, pick the less-utilized account
+_claude_tmux() {
+  local acct="\$1"; shift
+  if [ "\$acct" = "auto" ]; then
+    acct=\$(bash ~/.claude/scripts/pick-account.sh 2>/dev/null || echo "1")
+  fi
+  local session
+  if [ -n "\${TMUX:-}" ]; then
+    session=\$(tmux display-message -p '#S' 2>/dev/null)
+  fi
+  : "\${session:=\${CLAUDE_TMUX_SESSION:-\$(basename "\$PWD" | tr -c '[:alnum:]_-' '_')}}"
+  local wname="acct\${acct}"
+  local env_prefix=""
+  [ "\$acct" = "2" ] && env_prefix="CLAUDE_CONFIG_DIR=$ACCOUNT2_DIR "
+  local cmd="\${env_prefix}claude \$*"
+  if tmux has-session -t "\$session" 2>/dev/null; then
+    tmux new-window -t "\$session" -n "\$wname" -c "\$PWD" "\$cmd"
+  else
+    tmux new-session -d -s "\$session" -n "\$wname" -c "\$PWD" "\$cmd"
+  fi
+  if [ -n "\${TMUX:-}" ]; then
+    tmux select-window -t "\${session}:\${wname}" 2>/dev/null || tmux switch-client -t "\$session"
+  else
+    tmux attach -t "\$session"
+  fi
+}
+# Default — auto-pick the less-used account
+$ALIAS_AUTO()    { _claude_tmux auto "\$@"; }
+$ALIAS_AUTO_R()  { _claude_tmux auto --dangerously-skip-permissions "\$@"; }
+# Explicit account selection
+$ALIAS_1()   { _claude_tmux 1 "\$@"; }
+$ALIAS_1R()  { _claude_tmux 1 --dangerously-skip-permissions "\$@"; }
+$ALIAS_2()   { _claude_tmux 2 "\$@"; }
+$ALIAS_2R()  { _claude_tmux 2 --dangerously-skip-permissions "\$@"; }
 alias $USAGE_ALIAS="CLAUDE_CONFIG_DIR_2=$ACCOUNT2_DIR bash ~/.claude/scripts/claude-usage.sh"
+alias ccls='tmux ls'                    # list all tmux sessions
+alias cca='tmux attach'                 # attach most recent session (or -t <name>)
 ALIASES
-  echo "  Added aliases to $SHELL_RC:"
-  echo "    $ALIAS_1, $ALIAS_2, $ALIAS_1R, $ALIAS_2R, $USAGE_ALIAS"
+  echo "  Added shell functions/aliases to $SHELL_RC:"
+  echo "    $ALIAS_AUTO, $ALIAS_AUTO_R   — auto-pick less-used account"
+  echo "    $ALIAS_1, $ALIAS_1R          — explicit account 1"
+  echo "    $ALIAS_2, $ALIAS_2R          — explicit account 2"
+  echo "    $USAGE_ALIAS, ccls, cca"
 fi
 
 # 5. Create second config dir + symlink shared resources
@@ -243,10 +286,17 @@ else
 fi
 
 echo "Usage:"
-echo "  $ALIAS_1 / $ALIAS_1R   — account 1 (with/without permission prompts)"
-echo "  $ALIAS_2 / $ALIAS_2R   — account 2"
-echo "  $USAGE_ALIAS           — show both accounts' usage"
+echo "  $ALIAS_AUTO / $ALIAS_AUTO_R   — auto-pick less-used account (default)"
+echo "  $ALIAS_1 / $ALIAS_1R          — explicit account 1"
+echo "  $ALIAS_2 / $ALIAS_2R          — explicit account 2"
+echo "  $USAGE_ALIAS                  — show both accounts' usage"
+echo "  ccls                          — list tmux sessions"
+echo "  cca                           — attach last tmux session"
 echo ""
-echo "Rate limit handling is automatic."
+echo "Each invocation opens a tmux window named acct1 or acct2 in"
+echo "a session matching your project (basename of cwd)."
+echo ""
+echo "Rate limit handling is automatic — hook switches to the other account"
+echo "and resumes the same conversation in a new tmux window."
 echo ""
 echo "Restart your shell: source $SHELL_RC"

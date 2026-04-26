@@ -59,8 +59,9 @@ ACCOUNT2_DIR=~/.claude-work ALIAS_1=home ALIAS_2=work bash install.sh
 | Env var | Default | Purpose |
 |---------|---------|---------|
 | `ACCOUNT2_DIR` | `~/.claude-account2` | Path for second config dir |
-| `ALIAS_1` | `cc` | Alias for account 1 (auto-derives `cc` + `ccr`) |
-| `ALIAS_2` | `cc2` | Alias for account 2 (auto-derives `cc2` + `cc2r`) |
+| `ALIAS_AUTO` | `cc` | Auto-pick command (auto-derives `ccr`) |
+| `ALIAS_1` | `cc1` | Explicit account 1 (auto-derives `cc1r`) |
+| `ALIAS_2` | `cc2` | Explicit account 2 (auto-derives `cc2r`) |
 | `USAGE_ALIAS` | `claude-usage` | Alias for the usage viewer |
 
 The installer patches the installed hook script so that `ACCOUNT2_DIR` is baked in — you don't need to export it in every shell.
@@ -99,13 +100,22 @@ Each config dir stores its own credentials. No manual token management needed af
 
 ## Usage
 
+Commands are tmux-aware: each invocation opens a window named `acct1` or `acct2` in a session matching your project (basename of cwd, override with `CLAUDE_TMUX_SESSION`). Inside an existing tmux session it adds a window; outside it creates and attaches.
+
 ```bash
-cc          # Start with account 1
-cc2         # Start with account 2
-ccr         # Account 1, skip permission prompts
-cc2r        # Account 2, skip permission prompts
-claude-usage  # Show 5h and 7d usage for both accounts
+cc          # Auto-pick less-used account (default)
+ccr         # Auto-pick + skip permission prompts
+cc1         # Explicit account 1
+cc1r        # Explicit account 1 + skip permission prompts
+cc2         # Explicit account 2
+cc2r        # Explicit account 2 + skip permission prompts
+
+claude-usage  # Show 5h/7d usage for both accounts
+ccls          # List tmux sessions
+cca           # Attach last tmux session
 ```
+
+`cc` / `ccr` query the OAuth usage API (5h utilization, then 7d as tiebreaker), prefer accounts under 100%, and pick the lower one. The decision is cached for 60s in `/tmp/claude_pick_account_cache` (override with `PICK_CACHE_TTL`, force refresh with `bash ~/.claude/scripts/pick-account.sh --no-cache`).
 
 When rate limit hits, the hook automatically:
 1. Opens a new cmux tab (or tmux session) with the alternate account
@@ -156,9 +166,10 @@ This means each config dir has fully independent authentication — no token fil
 | File | Purpose |
 |------|---------|
 | `on-ratelimit.sh` | StopFailure hook — detect rate limit, switch config dir, resume session, auto-continue |
-| `on-stop-ratelimit.sh` | Stop hook — check transcript for rate limit markers (fallback detection) |
+| `on-stop-ratelimit.sh` | Stop hook — scan transcript's last assistant entry for rate_limit (primary detection on Claude Code 2.1.x) |
 | `claude-usage.sh` | Show usage for both accounts via API (cross-platform: Keychain on macOS, file on Linux) |
-| `install.sh` | One-command setup (detects OS, registers hooks, adds aliases) |
+| `pick-account.sh` | Pick less-used account by querying usage API (used by `cc`/`ccr` auto-pick; cached 60s) |
+| `install.sh` | One-command setup (detects OS, registers hooks, adds shell functions) |
 
 ### Runtime state (in `/tmp/`, cleared on reboot)
 
