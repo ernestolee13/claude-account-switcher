@@ -104,20 +104,22 @@ if [ ! -d "$HOME/.claude" ]; then
   echo "  NOTICE: ~/.claude not found. Run 'claude' once and login before completing setup."
 fi
 
-# Detect duplicate emails across configured accounts
-declare -A SEEN_EMAILS
+# Detect duplicate emails across configured accounts (bash 3.2 compatible — no associative arrays)
+SEEN_EMAILS_LIST=""
 for i in $(seq 1 "$NUM_ACCOUNTS"); do
   d=$(account_dir_for "$i")
   if [ -f "$d/.claude.json" ]; then
     email=$(jq -r '.oauthAccount.emailAddress // empty' "$d/.claude.json" 2>/dev/null)
     if [ -n "$email" ]; then
-      if [ -n "${SEEN_EMAILS[$email]:-}" ]; then
+      prev_id=$(echo "$SEEN_EMAILS_LIST" | awk -v e="$email" -F'\t' '$1==e{print $2; exit}')
+      if [ -n "$prev_id" ]; then
         echo ""
-        echo "  WARNING: account$i and account${SEEN_EMAILS[$email]} both have email=$email"
+        echo "  WARNING: account$i and account${prev_id} both have email=$email"
         echo "           Failover requires DIFFERENT accounts. Re-login one with another account:"
         echo "             CLAUDE_CONFIG_DIR=$d claude logout && CLAUDE_CONFIG_DIR=$d claude login"
       else
-        SEEN_EMAILS[$email]=$i
+        SEEN_EMAILS_LIST="${SEEN_EMAILS_LIST}${email}	${i}
+"
       fi
     fi
   fi
