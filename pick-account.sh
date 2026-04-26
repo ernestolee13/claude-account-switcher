@@ -17,15 +17,11 @@ set -u
 
 LIB="$(dirname "$0")/lib/accounts.sh"
 [ -f "$LIB" ] || LIB="$HOME/.claude/scripts/lib/accounts.sh"
-if [ -f "$LIB" ]; then
-  source "$LIB"
-else
-  # Minimal fallback if helper missing
-  accounts_list() {
-    printf "1\t%s\tdefault\n" "$HOME/.claude"
-    printf "2\t%s\tsecondary\n" "${CLAUDE_CONFIG_DIR_2:-$HOME/.claude-account2}"
-  }
+if [ ! -f "$LIB" ]; then
+  echo "ERROR: $LIB not found. Run install.sh first." >&2
+  echo "1"; exit 1
 fi
+source "$LIB"
 
 CACHE_FILE="/tmp/claude_pick_account_cache"
 CACHE_TTL="${PICK_CACHE_TTL:-60}"

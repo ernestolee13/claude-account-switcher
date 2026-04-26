@@ -69,7 +69,7 @@ ACCOUNT2_DIR=~/.claude-work bash install.sh
 
 Explicit-account aliases are always `cc1`, `cc1r`, `cc2`, `cc2r`, ..., `ccN`, `ccNr` — derived from `NUM_ACCOUNTS`.
 
-The installer writes a manifest at `~/.claude-accounts.json` so all scripts (`pick-account.sh`, `on-ratelimit.sh`, `claude-usage.sh`) discover accounts dynamically.
+The installer writes a manifest at `~/.claude-accounts.json`. All scripts read the manifest for account discovery — there's a single code path for any N (no special case for 2 accounts). If the manifest is missing, `lib/accounts.sh` auto-creates a default 2-account one on first source.
 
 ## Account setup
 

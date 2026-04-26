@@ -19,32 +19,13 @@
 
 unset NODE_OPTIONS 2>/dev/null || true
 
-# Source account manifest helper
+# Source account manifest helper (auto-creates default manifest if missing)
 LIB="$HOME/.claude/scripts/lib/accounts.sh"
-[ -f "$LIB" ] && source "$LIB" || {
-  # Inline fallback for backward-compat 2-account setup
-  accounts_list() {
-    printf "1\t%s\tdefault\n" "$HOME/.claude"
-    printf "2\t%s\tsecondary\n" "${CLAUDE_CONFIG_DIR_2:-$HOME/.claude-account2}"
-  }
-  account_dir() {
-    while IFS=$'\t' read -r id dir label; do
-      [ "$id" = "$1" ] && { echo "$dir"; return; }
-    done < <(accounts_list)
-  }
-  account_current_id() {
-    local cur="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-    while IFS=$'\t' read -r id dir label; do
-      [ "$dir" = "$cur" ] && { echo "$id"; return; }
-    done < <(accounts_list)
-    echo "1"
-  }
-  account_ids() {
-    while IFS=$'\t' read -r id dir label; do
-      echo "$id"
-    done < <(accounts_list)
-  }
-}
+if [ ! -f "$LIB" ]; then
+  echo "ERROR: $LIB not found. Run install.sh first." >&2
+  exit 1
+fi
+source "$LIB"
 
 INPUT=$(cat)
 ERROR_TYPE=$(echo "$INPUT" | jq -r '.error_type // .error // empty' 2>/dev/null || true)

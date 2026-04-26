@@ -10,12 +10,11 @@
 #   - Linux: <CONFIG_DIR>/.credentials.json
 
 LIB="$HOME/.claude/scripts/lib/accounts.sh"
-[ -f "$LIB" ] && source "$LIB" || {
-  accounts_list() {
-    printf "1\t%s\tdefault\n" "$HOME/.claude"
-    printf "2\t%s\tsecondary\n" "${CLAUDE_CONFIG_DIR_2:-$HOME/.claude-account2}"
-  }
-}
+if [ ! -f "$LIB" ]; then
+  echo "ERROR: $LIB not found. Run install.sh first." >&2
+  exit 1
+fi
+source "$LIB"
 
 read_token() {
   local config_dir="$1"
