@@ -156,31 +156,49 @@ start_resume_session() {
     return 1
   fi
 
+  local cmux_bin="${CMUX_BUNDLED_CLI_PATH:-/Applications/cmux.app/Contents/Resources/bin/cmux}"
   local script="/tmp/claude-resume-$$.sh"
+  local msg_file="/tmp/claude-resume-msg-$$.txt"
+  printf '%s' "$RESUME_MESSAGE" > "$msg_file"
+  # The auto-resume message is scheduled from inside this script (which runs in
+  # the new split's process tree) — sending it from the rate-limited claude's
+  # hook context fails with EPIPE because cmux closes the socket once the
+  # parent claude exits.
   cat > "$script" << RESUME_EOF
 #!/bin/bash
 cd "${CWD:-$HOME}"
-CLAUDE_CONFIG_DIR=$target_config claude --dangerously-skip-permissions -r $SESSION_ID
+CMUX_BIN="$cmux_bin"
+MSG_FILE="$msg_file"
+if [ -x "\$CMUX_BIN" ] && [ -n "\${CMUX_SURFACE_ID:-}" ] && [ -n "\${CMUX_WORKSPACE_ID:-}" ] && [ -f "\$MSG_FILE" ]; then
+  ( sleep 15 && \\
+    "\$CMUX_BIN" send --surface "\$CMUX_SURFACE_ID" --workspace "\$CMUX_WORKSPACE_ID" "\$(cat \$MSG_FILE)" 2>/dev/null && \\
+    "\$CMUX_BIN" send-key --surface "\$CMUX_SURFACE_ID" --workspace "\$CMUX_WORKSPACE_ID" enter 2>/dev/null && \\
+    rm -f "\$MSG_FILE" \\
+  ) &
+else
+  echo "[\$(date '+%Y-%m-%d %H:%M:%S')] WARN: auto-resume message skipped (CMUX_SURFACE_ID=\${CMUX_SURFACE_ID:-empty}, MSG_FILE=\$MSG_FILE)" >> "$HOME/.claude/logs/account-switch.log"
+fi
+CLAUDE_CONFIG_DIR=$target_config exec claude --dangerously-skip-permissions -r $SESSION_ID
 RESUME_EOF
   chmod +x "$script"
 
   # Prefer cmux
-  local cmux_bin="${CMUX_BUNDLED_CLI_PATH:-/Applications/cmux.app/Contents/Resources/bin/cmux}"
   if [ -x "$cmux_bin" ] && [ -n "${CMUX_WORKSPACE_ID:-}" ]; then
     local new_result new_surface
-    new_result=$("$cmux_bin" new-surface --workspace "$CMUX_WORKSPACE_ID" 2>&1 || true)
+    local -a split_args=("new-split" "right" "--workspace" "$CMUX_WORKSPACE_ID")
+    [ -n "${CMUX_SURFACE_ID:-}" ] && split_args+=("--surface" "$CMUX_SURFACE_ID")
+    new_result=$("$cmux_bin" "${split_args[@]}" 2>&1 || true)
     new_surface=$(echo "$new_result" | grep -oE "surface:[0-9]+" | head -1)
+    # Fall back to a fresh terminal surface if split fails
+    if [ -z "$new_surface" ]; then
+      new_result=$("$cmux_bin" new-surface --type terminal --workspace "$CMUX_WORKSPACE_ID" 2>&1 || true)
+      new_surface=$(echo "$new_result" | grep -oE "surface:[0-9]+" | head -1)
+    fi
     if [ -n "$new_surface" ]; then
       sleep 2
-      "$cmux_bin" send-key --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "enter" 2>/dev/null || true
-      sleep 1
       "$cmux_bin" send --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "bash $script" 2>/dev/null || true
       "$cmux_bin" send-key --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "enter" 2>/dev/null || true
-      ( sleep 15 && \
-        "$cmux_bin" send --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "$RESUME_MESSAGE" 2>/dev/null && \
-        "$cmux_bin" send-key --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "enter" 2>/dev/null \
-      ) &
-      log "cmux tab created: $new_surface with account${target_id} via $script"
+      log "cmux split-right created: $new_surface with account${target_id} via $script"
       return 0
     fi
   fi
