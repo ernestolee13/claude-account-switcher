@@ -1,26 +1,52 @@
 #!/bin/bash
-# Claude Code Account Switcher — StopFailure Hook
-# On rate limit: open new session with alternate CLAUDE_CONFIG_DIR
+# Claude Code Account Switcher — Rate Limit Hook
+# On rate limit: open new session with alternate CLAUDE_CONFIG_DIR.
 #
-# Claude Code automatically isolates credentials per config dir:
+# Supports N accounts via manifest at ~/.claude-accounts.json
+# (falls back to default 2-account setup if manifest absent).
+#
+# Each CLAUDE_CONFIG_DIR has fully isolated credentials:
 #   - macOS: separate Keychain entries ("Claude Code-credentials-<hash>")
-#   - Linux: separate ~/.claude[-account2]/.credentials.json files
-# so NO manual credential manipulation is needed.
+#   - Linux: separate ~/.claude*/.credentials.json files
 #
 # Setup:
 #   1. Login once per config dir:
 #        claude login
 #        CLAUDE_CONFIG_DIR=~/.claude-account2 claude login
-#   2. Register this hook in ~/.claude/settings.json
+#   2. Register hook in ~/.claude/settings.json
 #
-# Requires: jq
+# Requires: jq, python3
 
-# Clear cmux NODE_OPTIONS to prevent temp file errors in child processes
 unset NODE_OPTIONS 2>/dev/null || true
 
+# Source account manifest helper
+LIB="$HOME/.claude/scripts/lib/accounts.sh"
+[ -f "$LIB" ] && source "$LIB" || {
+  # Inline fallback for backward-compat 2-account setup
+  accounts_list() {
+    printf "1\t%s\tdefault\n" "$HOME/.claude"
+    printf "2\t%s\tsecondary\n" "${CLAUDE_CONFIG_DIR_2:-$HOME/.claude-account2}"
+  }
+  account_dir() {
+    while IFS=$'\t' read -r id dir label; do
+      [ "$id" = "$1" ] && { echo "$dir"; return; }
+    done < <(accounts_list)
+  }
+  account_current_id() {
+    local cur="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+    while IFS=$'\t' read -r id dir label; do
+      [ "$dir" = "$cur" ] && { echo "$id"; return; }
+    done < <(accounts_list)
+    echo "1"
+  }
+  account_ids() {
+    while IFS=$'\t' read -r id dir label; do
+      echo "$id"
+    done < <(accounts_list)
+  }
+}
+
 INPUT=$(cat)
-# Claude Code 2.1.x StopFailure payload uses the key `.error` (not `.error_type`)
-# — this was the root cause of the auto-switch never firing. Accept both.
 ERROR_TYPE=$(echo "$INPUT" | jq -r '.error_type // .error // empty' 2>/dev/null || true)
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null || true)
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null || true)
@@ -33,16 +59,13 @@ DEBUG_FILE="$HOME/.claude/logs/account-switch-payloads.log"
 mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"; }
 
-# Rotate payload log if > 1MB to prevent unbounded growth
+# Rotate payload log if > 1MB
 if [ -f "$DEBUG_FILE" ] && [ "$(stat -c %s "$DEBUG_FILE" 2>/dev/null || stat -f %z "$DEBUG_FILE" 2>/dev/null || echo 0)" -gt 1048576 ]; then
   mv "$DEBUG_FILE" "${DEBUG_FILE}.old" 2>/dev/null || true
 fi
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] source=$HOOK_SOURCE payload=$INPUT" >> "$DEBUG_FILE"
 
-# Extract the rate_limit UUID from the transcript's last assistant entry.
-# This is used both to (a) recover the error_type when the hook payload doesn't
-# include it and (b) populate RL_UUID for dedup so we don't switch twice on
-# the same event when multiple hook paths fire.
+# Recover error_type and uuid from transcript if missing
 if [ -z "$RL_UUID" ] && [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
   RECOVERED=$(tail -n 300 "$TRANSCRIPT_PATH" 2>/dev/null | python3 -c '
 import json, sys
@@ -67,7 +90,7 @@ fi
 
 [ "$ERROR_TYPE" != "rate_limit" ] && { log "$HOOK_SOURCE: error_type=$ERROR_TYPE (ignored)"; exit 0; }
 
-# Dedup: avoid re-triggering on the same rate_limit event
+# Dedup
 SEEN_FILE="/tmp/claude_ratelimit_seen_uuids"
 touch "$SEEN_FILE" 2>/dev/null || true
 if [ -n "$RL_UUID" ] && grep -q "^${RL_UUID}$" "$SEEN_FILE" 2>/dev/null; then
@@ -81,57 +104,54 @@ log "Env: CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-default} | CMUX_WORKSPACE_ID=${
 
 # --- Config ---
 COOLDOWN="${CLAUDE_SWITCH_COOLDOWN:-1800}"
-CONFIG_DIR_1="$HOME/.claude"
-CONFIG_DIR_2="${CLAUDE_CONFIG_DIR_2:-$HOME/.claude-account2}"
 STATE_FILE="/tmp/claude_active_account"
-# Auto-detect tmux binary (macOS homebrew, Linux system path, etc.)
 TMUX_BIN="${TMUX_BIN:-$(command -v tmux 2>/dev/null || echo '')}"
-# Resume message (override via env)
 RESUME_MESSAGE="${CLAUDE_RESUME_MESSAGE:-Rate limit으로 계정이 전환되었습니다. 이전 작업을 이어서 진행해주세요.}"
-# ---
 
-# Detect current account from CLAUDE_CONFIG_DIR
-if [ "${CLAUDE_CONFIG_DIR:-}" = "$CONFIG_DIR_2" ]; then
-  CURRENT="2"
-else
-  CURRENT="1"
-fi
-OTHER=$([ "$CURRENT" = "1" ] && echo "2" || echo "1")
+CURRENT_ID=$(account_current_id)
 NOW=$(date +%s)
 
-get_config_dir() {
-  [ "$1" = "2" ] && echo "$CONFIG_DIR_2" || echo "$CONFIG_DIR_1"
-}
-
-# Cross-platform desktop notification (macOS/Linux). Silent if neither tool exists.
+# Cross-platform notification
 notify() {
   local msg="$1" title="$2"
-  # macOS
-  if command -v osascript >/dev/null 2>&1; then
-    osascript -e "display notification \"$msg\" with title \"$title\"" 2>/dev/null || true
-  fi
-  # Linux (libnotify)
-  if command -v notify-send >/dev/null 2>&1; then
-    notify-send "$title" "$msg" 2>/dev/null || true
-  fi
-  # cmux (if available)
+  command -v osascript >/dev/null 2>&1 && osascript -e "display notification \"$msg\" with title \"$title\"" 2>/dev/null || true
+  command -v notify-send >/dev/null 2>&1 && notify-send "$title" "$msg" 2>/dev/null || true
   local cmux_bin="${CMUX_BUNDLED_CLI_PATH:-/Applications/cmux.app/Contents/Resources/bin/cmux}"
   [ -x "$cmux_bin" ] && "$cmux_bin" display-message "$msg" 2>/dev/null || true
 }
 
+# Pick next available account from manifest, excluding current and rate-limited.
+# Echoes the chosen account id, or empty if all are exhausted.
+pick_next_account() {
+  local exclude="$1"
+  local picker="$HOME/.claude/scripts/pick-account.sh"
+  if [ -x "$picker" ]; then
+    local choice
+    choice=$(bash "$picker" --no-cache 2>/dev/null)
+    [ -n "$choice" ] && [ "$choice" != "$exclude" ] && { echo "$choice"; return; }
+  fi
+  # Fallback: first non-excluded, non-rate-limited account from manifest
+  while read -r id; do
+    [ "$id" = "$exclude" ] && continue
+    local rl_file="/tmp/claude_ratelimit_account${id}"
+    if [ -f "$rl_file" ]; then
+      local rl_ts=$(cat "$rl_file" 2>/dev/null || echo 0)
+      [ $((NOW - rl_ts)) -lt "$COOLDOWN" ] && continue
+    fi
+    echo "$id"; return
+  done < <(account_ids)
+}
+
 start_resume_session() {
   local name="$1"
-  local target_config=$(get_config_dir "$OTHER")
-  local source_config=$(get_config_dir "$CURRENT")
+  local target_id="$2"
+  local target_config=$(account_dir "$target_id")
+  local source_config=$(account_dir "$CURRENT_ID")
 
-  # Cross-account session-resume prep:
-  #   - transcripts are shared via projects/ symlink, so the .jsonl exists
-  #   - BUT history.jsonl is per-config-dir; if target doesn't know the session,
-  #     `claude -r` falls back to first-time onboarding and WIPES target's
-  #     .claude.json to a stub (observed data-loss bug on 2026-04-23).
-  # Mitigation: copy the session's history entries into target's history.jsonl
-  # before launching, and bail out (with a clear log) if target has no valid
-  # .claude.json to resume into.
+  [ -z "$target_config" ] && { log "ABORT: cannot resolve config dir for account $target_id"; return 1; }
+
+  # Copy session's history.jsonl entries to target before launching `claude -r`
+  # (target without history fallbacks to onboarding and wipes .claude.json)
   if [ -n "$SESSION_ID" ]; then
     local src_hist="$source_config/history.jsonl"
     local dst_hist="$target_config/history.jsonl"
@@ -145,19 +165,16 @@ start_resume_session() {
     fi
   fi
 
-  # Safety gate: refuse to launch if target .claude.json is missing/tiny.
-  # A stub <2KB typically lacks oauthAccount/projects and will trigger the
-  # onboarding overwrite loop.
+  # Safety gate: refuse to launch if target .claude.json is missing/tiny
   local target_profile="$target_config/.claude.json"
   local profile_size=0
   [ -f "$target_profile" ] && profile_size=$(stat -c %s "$target_profile" 2>/dev/null || stat -f %z "$target_profile" 2>/dev/null || echo 0)
   if [ "$profile_size" -lt 2048 ]; then
-    log "ABORT: target .claude.json missing or too small (size=$profile_size). Refusing to launch to avoid corruption."
-    notify "Account switch aborted — ~/.claude${OTHER/1/}/.claude.json missing. Run claude manually once to recover." "Claude Code Account Switcher"
+    log "ABORT: target .claude.json missing or too small (size=$profile_size). Refusing to launch."
+    notify "Account switch aborted — $target_config/.claude.json missing. Run claude there manually once to recover." "Claude Code Account Switcher"
     return 1
   fi
 
-  # Write resume script to avoid command garbling in send-to-tty cases
   local script="/tmp/claude-resume-$$.sh"
   cat > "$script" << RESUME_EOF
 #!/bin/bash
@@ -166,35 +183,29 @@ CLAUDE_CONFIG_DIR=$target_config claude --dangerously-skip-permissions -r $SESSI
 RESUME_EOF
   chmod +x "$script"
 
-  # Prefer cmux if available and CMUX_WORKSPACE_ID is set
+  # Prefer cmux
   local cmux_bin="${CMUX_BUNDLED_CLI_PATH:-/Applications/cmux.app/Contents/Resources/bin/cmux}"
   if [ -x "$cmux_bin" ] && [ -n "${CMUX_WORKSPACE_ID:-}" ]; then
-    local new_result
+    local new_result new_surface
     new_result=$("$cmux_bin" new-surface --workspace "$CMUX_WORKSPACE_ID" 2>&1 || true)
-    local new_surface
     new_surface=$(echo "$new_result" | grep -oE "surface:[0-9]+" | head -1)
     if [ -n "$new_surface" ]; then
-      # Wait for shell init, dismiss any prompts, then run script
       sleep 2
       "$cmux_bin" send-key --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "enter" 2>/dev/null || true
       sleep 1
       "$cmux_bin" send --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "bash $script" 2>/dev/null || true
       "$cmux_bin" send-key --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "enter" 2>/dev/null || true
-      # After session loads, send continue message
       ( sleep 15 && \
         "$cmux_bin" send --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "$RESUME_MESSAGE" 2>/dev/null && \
         "$cmux_bin" send-key --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "enter" 2>/dev/null \
       ) &
-      log "cmux tab created: $new_surface with account${OTHER} via $script"
+      log "cmux tab created: $new_surface with account${target_id} via $script"
       return 0
     fi
   fi
 
-  # Fallback: tmux
+  # tmux: split current pane > new window > detached session
   if [ -n "$TMUX_BIN" ] && [ -x "$TMUX_BIN" ]; then
-    # Preferred UX: split the SAME pane where the rate-limited claude is running,
-    # so the user visually sees the old (exhausted) session next to the new
-    # (account${OTHER}) resume. Focus auto-moves to the new pane.
     local source_pane="${TMUX_PANE:-}"
     if [ -n "$source_pane" ]; then
       local new_pane
@@ -203,72 +214,79 @@ RESUME_EOF
         ( sleep 15 && \
           "$TMUX_BIN" send-keys -t "$new_pane" "$RESUME_MESSAGE" Enter 2>/dev/null \
         ) &
-        log "tmux pane '$new_pane' split from '$source_pane' for account${OTHER} via $script"
+        log "tmux pane '$new_pane' split for account${target_id} via $script"
         return 0
       fi
     fi
 
-    # Fallback A: add a window to the existing session (no TMUX_PANE available)
     local target_session=""
-    if [ -n "${TMUX:-}" ]; then
-      target_session=$("$TMUX_BIN" display-message -p '#S' 2>/dev/null || true)
-    fi
+    [ -n "${TMUX:-}" ] && target_session=$("$TMUX_BIN" display-message -p '#S' 2>/dev/null || true)
     if [ -n "$target_session" ]; then
-      local wname="failover-acct${OTHER}"
+      local wname="failover-acct${target_id}"
       "$TMUX_BIN" new-window -t "$target_session" -n "$wname" -c "${CWD:-$HOME}" "bash $script"
       ( sleep 15 && \
         "$TMUX_BIN" send-keys -t "${target_session}:${wname}" "$RESUME_MESSAGE" Enter 2>/dev/null \
       ) &
-      log "tmux window '$wname' added to session '$target_session' for account${OTHER} via $script"
+      log "tmux window '$wname' added for account${target_id} via $script"
       return 0
     fi
 
-    # Fallback B: detached session (user must `tmux attach -t $name`)
     "$TMUX_BIN" kill-session -t "$name" 2>/dev/null || true
     "$TMUX_BIN" new-session -d -s "$name" -c "${CWD:-$HOME}" "bash $script"
     ( sleep 15 && \
       "$TMUX_BIN" send-keys -t "$name" "$RESUME_MESSAGE" Enter 2>/dev/null \
     ) &
-    log "tmux detached session '$name' created with account${OTHER} via $script"
+    log "tmux detached session '$name' created with account${target_id} via $script"
     return 0
   fi
 
-  # Last resort: log manual instructions
   log "No cmux or tmux available. Resume manually: bash $script"
-  notify "Rate limit switched to account${OTHER}. Run manually: bash $script" "Claude Code"
+  notify "Rate limit switched to account${target_id}. Run manually: bash $script" "Claude Code"
 }
 
-# Record rate limit
-echo "$NOW" > "/tmp/claude_ratelimit_account${CURRENT}"
+# Mark current account as rate-limited
+echo "$NOW" > "/tmp/claude_ratelimit_account${CURRENT_ID}"
 
-# Check other account
-OTHER_RL_TIME=$(cat "/tmp/claude_ratelimit_account${OTHER}" 2>/dev/null || echo "0")
-SINCE_OTHER=$(( NOW - OTHER_RL_TIME ))
+# Find next available account (excluding current)
+NEXT_ID=$(pick_next_account "$CURRENT_ID")
 
-if [ "$SINCE_OTHER" -lt "$COOLDOWN" ]; then
-  # --- Both exhausted ---
+if [ -n "$NEXT_ID" ]; then
+  # --- Switch to next account ---
+  echo "$NEXT_ID" > "$STATE_FILE"
+  rm -f "/tmp/claude_ratelimit_account${NEXT_ID}"
+  log "Switched: account${CURRENT_ID} → account${NEXT_ID} | config dir: $(account_dir "$NEXT_ID")"
+  notify "Rate limit hit. Switching account${CURRENT_ID}→${NEXT_ID}." "Claude Code Account Switcher"
+  start_resume_session "claude-failover" "$NEXT_ID"
+  log "Resume session created for account${NEXT_ID}"
+else
+  # --- All accounts exhausted ---
   OLD_PID=$(cat /tmp/claude_resume_pid 2>/dev/null || echo "")
   [ -n "$OLD_PID" ] && kill "$OLD_PID" 2>/dev/null || true
 
-  ACCT1_TIME=$(cat /tmp/claude_ratelimit_account1 2>/dev/null || echo "$NOW")
-  ACCT2_TIME=$(cat /tmp/claude_ratelimit_account2 2>/dev/null || echo "$NOW")
-  if [ "$ACCT1_TIME" -le "$ACCT2_TIME" ]; then
-    RECOVER_ACCT="1"; RECOVER_TIME=$ACCT1_TIME
-  else
-    RECOVER_ACCT="2"; RECOVER_TIME=$ACCT2_TIME
-  fi
+  # Find earliest-rate-limited account (will recover first)
+  RECOVER_ID=""
+  RECOVER_TIME=$NOW
+  while read -r id; do
+    rl_file="/tmp/claude_ratelimit_account${id}"
+    [ ! -f "$rl_file" ] && continue
+    ts=$(cat "$rl_file" 2>/dev/null || echo "$NOW")
+    if [ -z "$RECOVER_ID" ] || [ "$ts" -lt "$RECOVER_TIME" ]; then
+      RECOVER_ID="$id"; RECOVER_TIME="$ts"
+    fi
+  done < <(account_ids)
 
+  RECOVER_ID="${RECOVER_ID:-1}"
   WAIT_SECS=$(( RECOVER_TIME + COOLDOWN - NOW ))
   [ "$WAIT_SECS" -lt 60 ] && WAIT_SECS=60
   WAIT_MINS=$(( WAIT_SECS / 60 ))
 
-  echo "$RECOVER_ACCT" > "$STATE_FILE"
-  notify "Both accounts exhausted. Auto-resume in ~${WAIT_MINS}min." "Claude Code"
+  echo "$RECOVER_ID" > "$STATE_FILE"
+  notify "All ${HOOK_SOURCE:-} accounts exhausted. Auto-resume in ~${WAIT_MINS}min." "Claude Code"
 
-  RECOVER_CONFIG=$(get_config_dir "$RECOVER_ACCT")
+  RECOVER_CONFIG=$(account_dir "$RECOVER_ID")
   nohup bash -c "
     sleep $WAIT_SECS
-    rm -f /tmp/claude_ratelimit_account${RECOVER_ACCT}
+    rm -f /tmp/claude_ratelimit_account${RECOVER_ID}
 
     RESUME_CMD=\$(cat /tmp/claude_resume_command 2>/dev/null || echo '')
     if [ -n \"\$RESUME_CMD\" ]; then
@@ -278,25 +296,16 @@ if [ "$SINCE_OTHER" -lt "$COOLDOWN" ]; then
       '$TMUX_BIN' kill-session -t claude-resume 2>/dev/null || true
       '$TMUX_BIN' new-session -d -s claude-resume -c '${CWD:-$HOME}' 'CLAUDE_CONFIG_DIR=$RECOVER_CONFIG claude --dangerously-skip-permissions -r $SESSION_ID'
     fi
-    # Notify (cross-platform)
     if command -v osascript >/dev/null 2>&1; then
-      osascript -e 'display notification \"Recovered (account${RECOVER_ACCT}). tmux attach -t claude-resume\" with title \"Claude Code\"' 2>/dev/null || true
+      osascript -e 'display notification \"Recovered (account${RECOVER_ID}). tmux attach -t claude-resume\" with title \"Claude Code\"' 2>/dev/null || true
     fi
     if command -v notify-send >/dev/null 2>&1; then
-      notify-send 'Claude Code' 'Recovered (account${RECOVER_ACCT}). tmux attach -t claude-resume' 2>/dev/null || true
+      notify-send 'Claude Code' 'Recovered (account${RECOVER_ID}). tmux attach -t claude-resume' 2>/dev/null || true
     fi
     rm -f /tmp/claude_resume_pid
   " >/dev/null 2>&1 &
   echo "$!" > /tmp/claude_resume_pid
-
-else
-  # --- Switch to other account ---
-  echo "$OTHER" > "$STATE_FILE"
-  rm -f "/tmp/claude_ratelimit_account${OTHER}"
-  log "Switched: account${CURRENT} → account${OTHER} | config dir: $(get_config_dir "$OTHER")"
-  notify "Rate limit hit. Switching account${CURRENT}→${OTHER}." "Claude Code Account Switcher"
-  start_resume_session "claude-failover"
-  log "Resume session created for account${OTHER}"
+  log "All accounts exhausted. Will resume account${RECOVER_ID} in ${WAIT_SECS}s."
 fi
 
 exit 0

@@ -41,30 +41,35 @@ bash install.sh
 
 The installer detects OS, registers both hooks, and adds aliases to `.zshrc` or `.bashrc`.
 
-### Customizing paths and alias names
+### Customizing accounts (N accounts supported)
 
-Set env vars before running `install.sh`:
+Default is 2 accounts. Set env vars before `install.sh` for more:
 
 ```bash
-# Custom config dir for account 2
+# 3 accounts with default paths (~/.claude, ~/.claude-account2, ~/.claude-account3)
+NUM_ACCOUNTS=3 bash install.sh
+
+# 3 accounts with custom paths and labels
+NUM_ACCOUNTS=3 \
+  ACCOUNT2_DIR=~/.claude-work ACCOUNT2_LABEL=work \
+  ACCOUNT3_DIR=~/.claude-personal ACCOUNT3_LABEL=personal \
+  bash install.sh
+
+# Just rename the second account dir (N stays 2)
 ACCOUNT2_DIR=~/.claude-work bash install.sh
-
-# Custom alias names
-ALIAS_1=cpersonal ALIAS_2=cwork bash install.sh
-
-# Combine
-ACCOUNT2_DIR=~/.claude-work ALIAS_1=home ALIAS_2=work bash install.sh
 ```
 
 | Env var | Default | Purpose |
 |---------|---------|---------|
-| `ACCOUNT2_DIR` | `~/.claude-account2` | Path for second config dir |
-| `ALIAS_AUTO` | `cc` | Auto-pick command (auto-derives `ccr`) |
-| `ALIAS_1` | `cc1` | Explicit account 1 (auto-derives `cc1r`) |
-| `ALIAS_2` | `cc2` | Explicit account 2 (auto-derives `cc2r`) |
-| `USAGE_ALIAS` | `claude-usage` | Alias for the usage viewer |
+| `NUM_ACCOUNTS` | `2` | Number of accounts |
+| `ACCOUNT<N>_DIR` | `~/.claude` (1) / `~/.claude-account<N>` (2+) | Config dir for account N |
+| `ACCOUNT<N>_LABEL` | `default`/`secondary`/`tertiary`/... | Display label for account N |
+| `ALIAS_AUTO` | `cc` | Auto-pick command name (derives `ccr`) |
+| `USAGE_ALIAS` | `claude-usage` | Alias for usage viewer |
 
-The installer patches the installed hook script so that `ACCOUNT2_DIR` is baked in — you don't need to export it in every shell.
+Explicit-account aliases are always `cc1`, `cc1r`, `cc2`, `cc2r`, ..., `ccN`, `ccNr` — derived from `NUM_ACCOUNTS`.
+
+The installer writes a manifest at `~/.claude-accounts.json` so all scripts (`pick-account.sh`, `on-ratelimit.sh`, `claude-usage.sh`) discover accounts dynamically.
 
 ## Account setup
 
@@ -74,8 +79,9 @@ The installer patches the installed hook script so that `ACCOUNT2_DIR` is baked 
 # Account 1 (default config dir: ~/.claude)
 claude login
 
-# Account 2 (separate config dir: ~/.claude-account2)
+# Account 2..N (separate config dirs)
 CLAUDE_CONFIG_DIR=~/.claude-account2 claude login
+CLAUDE_CONFIG_DIR=~/.claude-account3 claude login   # if NUM_ACCOUNTS=3
 ```
 
 ### Headless Linux server
@@ -100,22 +106,22 @@ Each config dir stores its own credentials. No manual token management needed af
 
 ## Usage
 
-Commands are tmux-aware: each invocation opens a window named `acct1` or `acct2` in a session matching your project (basename of cwd, override with `CLAUDE_TMUX_SESSION`). Inside an existing tmux session it adds a window; outside it creates and attaches.
+Commands are tmux-aware: each invocation opens a window named `acct<N>` in a session matching your project (basename of cwd, override with `CLAUDE_TMUX_SESSION`). Inside an existing tmux session it adds a window; outside it creates and attaches.
 
 ```bash
-cc          # Auto-pick less-used account (default)
+cc          # Auto-pick least-used account across all configured accounts (default)
 ccr         # Auto-pick + skip permission prompts
-cc1         # Explicit account 1
-cc1r        # Explicit account 1 + skip permission prompts
-cc2         # Explicit account 2
-cc2r        # Explicit account 2 + skip permission prompts
+cc1, cc1r   # Explicit account 1
+cc2, cc2r   # Explicit account 2
+cc3, cc3r   # Explicit account 3 (if NUM_ACCOUNTS=3)
+... (up to ccN, ccNr)
 
-claude-usage  # Show 5h/7d usage for both accounts
+claude-usage  # Show 5h/7d usage for all accounts
 ccls          # List tmux sessions
 cca           # Attach last tmux session
 ```
 
-`cc` / `ccr` query the OAuth usage API (5h utilization, then 7d as tiebreaker), prefer accounts under 100%, and pick the lower one. The decision is cached for 60s in `/tmp/claude_pick_account_cache` (override with `PICK_CACHE_TTL`, force refresh with `bash ~/.claude/scripts/pick-account.sh --no-cache`).
+`cc` / `ccr` query the OAuth usage API for all accounts (filtering rate-limited ones), prefer accounts under 100% 5h utilization, and pick the lowest. Decisions are cached for 60s (override with `PICK_CACHE_TTL`, force refresh with `bash ~/.claude/scripts/pick-account.sh --no-cache`).
 
 When rate limit hits, the hook automatically:
 1. Opens a new cmux tab (or tmux session) with the alternate account
@@ -167,9 +173,23 @@ This means each config dir has fully independent authentication — no token fil
 |------|---------|
 | `on-ratelimit.sh` | StopFailure hook — detect rate limit, switch config dir, resume session, auto-continue |
 | `on-stop-ratelimit.sh` | Stop hook — scan transcript's last assistant entry for rate_limit (primary detection on Claude Code 2.1.x) |
-| `claude-usage.sh` | Show usage for both accounts via API (cross-platform: Keychain on macOS, file on Linux) |
-| `pick-account.sh` | Pick less-used account by querying usage API (used by `cc`/`ccr` auto-pick; cached 60s) |
-| `install.sh` | One-command setup (detects OS, registers hooks, adds shell functions) |
+| `claude-usage.sh` | Show usage for all accounts via API (cross-platform: Keychain on macOS, file on Linux) |
+| `pick-account.sh` | Pick least-used account by querying usage API (used by `cc`/`ccr` auto-pick; cached 60s) |
+| `lib/accounts.sh` | Manifest helper — reads `~/.claude-accounts.json`, falls back to 2-account default |
+| `install.sh` | One-command setup (detects OS, writes manifest, registers hooks, adds shell functions) |
+
+### Account manifest (`~/.claude-accounts.json`)
+
+```json
+{
+  "accounts": [
+    {"id": 1, "config_dir": "~/.claude", "label": "default"},
+    {"id": 2, "config_dir": "~/.claude-account2", "label": "secondary"}
+  ]
+}
+```
+
+Generated by the installer based on `NUM_ACCOUNTS` and `ACCOUNT<N>_DIR`/`ACCOUNT<N>_LABEL` env vars. All scripts read this for account discovery — edit it manually to add/remove accounts later (re-run `install.sh` to regenerate aliases).
 
 ### Runtime state (in `/tmp/`, cleared on reboot)
 

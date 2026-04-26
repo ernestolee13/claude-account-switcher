@@ -2,31 +2,54 @@
 # Claude Account Switcher — Installer (macOS + Linux)
 # Usage: bash install.sh
 #
+# Default: 2 accounts (~/.claude and ~/.claude-account2)
+#
 # Customize via env vars (before running):
-#   ACCOUNT2_DIR=~/.claude-work  bash install.sh
-#   ALIAS_1=cpersonal ALIAS_2=cwork  bash install.sh
+#   NUM_ACCOUNTS=3 bash install.sh                    # N accounts
+#   ACCOUNT2_DIR=~/.claude-work bash install.sh       # custom path
+#   ACCOUNT2_DIR=~/.claude-work ACCOUNT3_DIR=~/.claude-personal NUM_ACCOUNTS=3 bash install.sh
 #
 # Env vars:
-#   ACCOUNT2_DIR  — path for second config dir (default: ~/.claude-account2)
-#   ALIAS_1       — alias name for account 1 (default: cc)
-#   ALIAS_2       — alias name for account 2 (default: cc2)
-#   USAGE_ALIAS   — alias name for usage viewer (default: claude-usage)
+#   NUM_ACCOUNTS         — number of accounts (default: 2)
+#   ACCOUNT<N>_DIR       — config dir for account N (default: ~/.claude for 1, ~/.claude-account<N> for 2+)
+#   ACCOUNT<N>_LABEL     — label for account N (default: "" / "default" / "secondary" / "tertiary" / ...)
+#   ALIAS_AUTO           — auto-pick command name (default: cc)
+#   USAGE_ALIAS          — usage viewer alias (default: claude-usage)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CLAUDE_SCRIPTS="$HOME/.claude/scripts"
+CLAUDE_LIB="$CLAUDE_SCRIPTS/lib"
 CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+ACCOUNT_MANIFEST="$HOME/.claude-accounts.json"
 
-# Customizable
-ACCOUNT2_DIR="${ACCOUNT2_DIR:-$HOME/.claude-account2}"
-ALIAS_AUTO="${ALIAS_AUTO:-cc}"     # auto-pick less-utilized account
-ALIAS_1="${ALIAS_1:-cc1}"          # explicit account 1
-ALIAS_2="${ALIAS_2:-cc2}"          # explicit account 2
-USAGE_ALIAS="${USAGE_ALIAS:-claude-usage}"
+NUM_ACCOUNTS="${NUM_ACCOUNTS:-2}"
+ALIAS_AUTO="${ALIAS_AUTO:-cc}"
 ALIAS_AUTO_R="${ALIAS_AUTO}r"
-ALIAS_1R="${ALIAS_1}r"
-ALIAS_2R="${ALIAS_2}r"
+USAGE_ALIAS="${USAGE_ALIAS:-claude-usage}"
+
+# Resolve account N's config dir (env override or default pattern)
+account_dir_for() {
+  local n="$1"
+  local var="ACCOUNT${n}_DIR"
+  local val="${!var:-}"
+  if [ -z "$val" ]; then
+    if [ "$n" = "1" ]; then
+      val="$HOME/.claude"
+    else
+      val="$HOME/.claude-account${n}"
+    fi
+  fi
+  # Expand tilde
+  echo "${val/#\~/$HOME}"
+}
+
+account_label_for() {
+  local n="$1"
+  local var="ACCOUNT${n}_LABEL"
+  echo "${!var:-}"
+}
 
 # Detect OS
 OS="unknown"
@@ -52,12 +75,16 @@ install_hint() {
 
 echo "=== Claude Account Switcher — Install ==="
 echo "  OS:            $OS"
-echo "  Account 2 dir: $ACCOUNT2_DIR"
-echo "  Aliases:       $ALIAS_1 / $ALIAS_1R / $ALIAS_2 / $ALIAS_2R / $USAGE_ALIAS"
+echo "  Accounts:      $NUM_ACCOUNTS"
+for i in $(seq 1 "$NUM_ACCOUNTS"); do
+  d=$(account_dir_for "$i")
+  l=$(account_label_for "$i")
+  printf "    cc%-2s         %s%s\n" "$i" "$d" "${l:+ ($l)}"
+done
 echo ""
 
-# 1. Check prerequisites
-echo "[1/5] Checking prerequisites..."
+# 1. Prerequisites
+echo "[1/6] Checking prerequisites..."
 command -v claude >/dev/null 2>&1 || { echo "ERROR: claude not found. Install Claude Code first: https://claude.ai/code"; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "ERROR: jq not found. Install with: $(install_hint jq)"; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "ERROR: python3 not found. Install with: $(install_hint python3)"; exit 1; }
@@ -72,59 +99,71 @@ echo "  jq:      $(jq --version 2>/dev/null)"
 echo "  python3: $(python3 --version 2>/dev/null)"
 command -v tmux >/dev/null 2>&1 && echo "  tmux:    $(tmux -V 2>/dev/null)"
 
-# First-time check: if ~/.claude doesn't exist, Claude Code was never run
 if [ ! -d "$HOME/.claude" ]; then
   echo ""
-  echo "  NOTICE: ~/.claude not found. Claude Code has never been run."
-  echo "          Run 'claude' once (and login) before completing setup."
-  echo "          You can still proceed — ~/.claude will be created on first login."
+  echo "  NOTICE: ~/.claude not found. Run 'claude' once and login before completing setup."
 fi
 
-# Detect existing setup — warn if accounts already share an email (possible misconfig)
-ACCT1_EMAIL=""
-ACCT2_EMAIL=""
-if [ -f "$HOME/.claude/.claude.json" ]; then
-  ACCT1_EMAIL=$(jq -r '.oauthAccount.emailAddress // empty' "$HOME/.claude/.claude.json" 2>/dev/null)
-fi
-if [ -f "$ACCOUNT2_DIR/.claude.json" ]; then
-  ACCT2_EMAIL=$(jq -r '.oauthAccount.emailAddress // empty' "$ACCOUNT2_DIR/.claude.json" 2>/dev/null)
-fi
-if [ -n "$ACCT1_EMAIL" ] && [ "$ACCT1_EMAIL" = "$ACCT2_EMAIL" ]; then
-  echo ""
-  echo "  WARNING: Both config dirs appear to have the same account ($ACCT1_EMAIL)."
-  echo "           Rate limit failover only helps when the two accounts are different."
-  echo "           Consider logging out of one and logging in with a different account:"
-  echo "             CLAUDE_CONFIG_DIR=$ACCOUNT2_DIR claude logout"
-  echo "             CLAUDE_CONFIG_DIR=$ACCOUNT2_DIR claude login"
-fi
+# Detect duplicate emails across configured accounts
+declare -A SEEN_EMAILS
+for i in $(seq 1 "$NUM_ACCOUNTS"); do
+  d=$(account_dir_for "$i")
+  if [ -f "$d/.claude.json" ]; then
+    email=$(jq -r '.oauthAccount.emailAddress // empty' "$d/.claude.json" 2>/dev/null)
+    if [ -n "$email" ]; then
+      if [ -n "${SEEN_EMAILS[$email]:-}" ]; then
+        echo ""
+        echo "  WARNING: account$i and account${SEEN_EMAILS[$email]} both have email=$email"
+        echo "           Failover requires DIFFERENT accounts. Re-login one with another account:"
+        echo "             CLAUDE_CONFIG_DIR=$d claude logout && CLAUDE_CONFIG_DIR=$d claude login"
+      else
+        SEEN_EMAILS[$email]=$i
+      fi
+    fi
+  fi
+done
 
-# 2. Copy scripts and patch ACCOUNT2_DIR if customized
+# 2. Generate manifest
 echo ""
-echo "[2/5] Installing scripts to $CLAUDE_SCRIPTS..."
-mkdir -p "$CLAUDE_SCRIPTS"
+echo "[2/6] Writing account manifest: $ACCOUNT_MANIFEST"
+{
+  echo "{"
+  echo '  "accounts": ['
+  for i in $(seq 1 "$NUM_ACCOUNTS"); do
+    d=$(account_dir_for "$i")
+    l=$(account_label_for "$i")
+    [ -z "$l" ] && {
+      case "$i" in
+        1) l="default" ;;
+        2) l="secondary" ;;
+        3) l="tertiary" ;;
+        *) l="account${i}" ;;
+      esac
+    }
+    sep=","
+    [ "$i" = "$NUM_ACCOUNTS" ] && sep=""
+    printf '    {"id": %d, "config_dir": "%s", "label": "%s"}%s\n' "$i" "$d" "$l" "$sep"
+  done
+  echo "  ]"
+  echo "}"
+} > "$ACCOUNT_MANIFEST"
+echo "  Wrote $NUM_ACCOUNTS accounts"
+
+# 3. Copy scripts
+echo ""
+echo "[3/6] Installing scripts to $CLAUDE_SCRIPTS..."
+mkdir -p "$CLAUDE_SCRIPTS" "$CLAUDE_LIB"
 cp "$SCRIPT_DIR/on-ratelimit.sh" "$CLAUDE_SCRIPTS/on-ratelimit.sh"
 cp "$SCRIPT_DIR/on-stop-ratelimit.sh" "$CLAUDE_SCRIPTS/on-stop-ratelimit.sh"
 cp "$SCRIPT_DIR/claude-usage.sh" "$CLAUDE_SCRIPTS/claude-usage.sh"
 cp "$SCRIPT_DIR/pick-account.sh" "$CLAUDE_SCRIPTS/pick-account.sh"
-
-# If custom ACCOUNT2_DIR, patch scripts so hook doesn't rely on shell env
-if [ "$ACCOUNT2_DIR" != "$HOME/.claude-account2" ]; then
-  ESC_DIR=$(printf '%s\n' "$ACCOUNT2_DIR" | sed 's/[\/&]/\\&/g')
-  sed -i.bak "s|\$HOME/.claude-account2|$ESC_DIR|g" \
-    "$CLAUDE_SCRIPTS/on-ratelimit.sh" \
-    "$CLAUDE_SCRIPTS/claude-usage.sh" \
-    "$CLAUDE_SCRIPTS/pick-account.sh"
-  rm -f "$CLAUDE_SCRIPTS"/*.bak
-  echo "  Patched scripts with ACCOUNT2_DIR=$ACCOUNT2_DIR"
-fi
-
-chmod +x "$CLAUDE_SCRIPTS/on-ratelimit.sh" "$CLAUDE_SCRIPTS/on-stop-ratelimit.sh" \
-         "$CLAUDE_SCRIPTS/claude-usage.sh" "$CLAUDE_SCRIPTS/pick-account.sh"
+cp "$SCRIPT_DIR/lib/accounts.sh" "$CLAUDE_LIB/accounts.sh"
+chmod +x "$CLAUDE_SCRIPTS"/*.sh "$CLAUDE_LIB/accounts.sh"
 echo "  Done"
 
-# 3. Register hooks in settings.json
+# 4. Register hooks
 echo ""
-echo "[3/5] Registering hooks..."
+echo "[4/6] Registering hooks..."
 [ -f "$CLAUDE_SETTINGS" ] || echo '{}' > "$CLAUDE_SETTINGS"
 
 TMPFILE=$(mktemp)
@@ -133,7 +172,7 @@ if ! jq -e '.hooks.StopFailure' "$CLAUDE_SETTINGS" >/dev/null 2>&1; then
   mv "$TMPFILE" "$CLAUDE_SETTINGS"
   echo "  StopFailure hook registered"
 else
-  echo "  StopFailure hook already exists — skipping (verify manually if needed)"
+  echo "  StopFailure hook already exists — skipping"
 fi
 
 TMPFILE=$(mktemp)
@@ -145,9 +184,9 @@ else
   echo "  Stop hook already exists — skipping"
 fi
 
-# 4. Setup shell aliases
+# 5. Setup shell functions/aliases
 echo ""
-echo "[4/5] Setting up shell aliases..."
+echo "[5/6] Setting up shell functions..."
 SHELL_RC=""
 case "${SHELL:-}" in
   */zsh)  SHELL_RC="$HOME/.zshrc" ;;
@@ -164,13 +203,27 @@ if grep -q "$MARKER" "$SHELL_RC" 2>/dev/null; then
   echo "  Aliases marker already present in $SHELL_RC — skipping"
   echo "  (Remove existing block manually to regenerate)"
 else
-  # Heredoc with no quoting around delimiter so env vars expand
+  # Build per-account env-prefix lookup table from manifest
+  CASE_BLOCK=""
+  for i in $(seq 1 "$NUM_ACCOUNTS"); do
+    d=$(account_dir_for "$i")
+    if [ "$i" = "1" ] && [ "$d" = "$HOME/.claude" ]; then
+      CASE_BLOCK="${CASE_BLOCK}    $i) env_prefix=\"\" ;;\n"
+    else
+      CASE_BLOCK="${CASE_BLOCK}    $i) env_prefix=\"CLAUDE_CONFIG_DIR=$d \" ;;\n"
+    fi
+  done
+
+  # Per-account explicit aliases (cc1, cc2, ..., ccN and their r-variants)
+  EXPLICIT_FUNCS=""
+  for i in $(seq 1 "$NUM_ACCOUNTS"); do
+    EXPLICIT_FUNCS="${EXPLICIT_FUNCS}cc${i}()  { _claude_tmux $i \"\$@\"; }\n"
+    EXPLICIT_FUNCS="${EXPLICIT_FUNCS}cc${i}r() { _claude_tmux $i --dangerously-skip-permissions \"\$@\"; }\n"
+  done
+
   cat >> "$SHELL_RC" << ALIASES
 
-$MARKER — tmux session per project, windows per account
-# - Inside tmux: new window in the CURRENT session
-# - Outside tmux: session name = \$CLAUDE_TMUX_SESSION or basename of cwd
-# - acct="auto": query usage, pick the less-utilized account
+$MARKER — tmux session per project, windows per account (N-account aware)
 _claude_tmux() {
   local acct="\$1"; shift
   if [ "\$acct" = "auto" ]; then
@@ -183,7 +236,9 @@ _claude_tmux() {
   : "\${session:=\${CLAUDE_TMUX_SESSION:-\$(basename "\$PWD" | tr -c '[:alnum:]_-' '_')}}"
   local wname="acct\${acct}"
   local env_prefix=""
-  [ "\$acct" = "2" ] && env_prefix="CLAUDE_CONFIG_DIR=$ACCOUNT2_DIR "
+  case "\$acct" in
+$(printf '%b' "$CASE_BLOCK")    *) env_prefix="" ;;
+  esac
   local cmd="\${env_prefix}claude \$*"
   if tmux has-session -t "\$session" 2>/dev/null; then
     tmux new-window -t "\$session" -n "\$wname" -c "\$PWD" "\$cmd"
@@ -196,72 +251,58 @@ _claude_tmux() {
     tmux attach -t "\$session"
   fi
 }
-# Default — auto-pick the less-used account
+# Auto-pick (default)
 $ALIAS_AUTO()    { _claude_tmux auto "\$@"; }
 $ALIAS_AUTO_R()  { _claude_tmux auto --dangerously-skip-permissions "\$@"; }
-# Explicit account selection
-$ALIAS_1()   { _claude_tmux 1 "\$@"; }
-$ALIAS_1R()  { _claude_tmux 1 --dangerously-skip-permissions "\$@"; }
-$ALIAS_2()   { _claude_tmux 2 "\$@"; }
-$ALIAS_2R()  { _claude_tmux 2 --dangerously-skip-permissions "\$@"; }
-alias $USAGE_ALIAS="CLAUDE_CONFIG_DIR_2=$ACCOUNT2_DIR bash ~/.claude/scripts/claude-usage.sh"
-alias ccls='tmux ls'                    # list all tmux sessions
-alias cca='tmux attach'                 # attach most recent session (or -t <name>)
+# Explicit per-account
+$(printf '%b' "$EXPLICIT_FUNCS")alias $USAGE_ALIAS="bash ~/.claude/scripts/claude-usage.sh"
+alias ccls='tmux ls'
+alias cca='tmux attach'
 ALIASES
-  echo "  Added shell functions/aliases to $SHELL_RC:"
-  echo "    $ALIAS_AUTO, $ALIAS_AUTO_R   — auto-pick less-used account"
-  echo "    $ALIAS_1, $ALIAS_1R          — explicit account 1"
-  echo "    $ALIAS_2, $ALIAS_2R          — explicit account 2"
+  echo "  Added shell functions to $SHELL_RC:"
+  echo "    $ALIAS_AUTO, $ALIAS_AUTO_R   — auto-pick across all $NUM_ACCOUNTS accounts"
+  for i in $(seq 1 "$NUM_ACCOUNTS"); do
+    echo "    cc${i}, cc${i}r              — explicit account $i"
+  done
   echo "    $USAGE_ALIAS, ccls, cca"
 fi
 
-# 5. Create second config dir + symlink shared resources
+# 6. Create config dirs + symlink shared resources for accounts 2+
 echo ""
-echo "[5/5] Setting up second config dir: $ACCOUNT2_DIR"
+echo "[6/6] Setting up config dirs..."
+for i in $(seq 1 "$NUM_ACCOUNTS"); do
+  d=$(account_dir_for "$i")
+  mkdir -p "$d"
+done
 
-if [ ! -d "$HOME/.claude" ]; then
-  echo "  WARNING: ~/.claude not found. Run 'claude' at least once before logging in to account 2."
-fi
-
-mkdir -p "$ACCOUNT2_DIR"
-
-# Symlink shared resources so both accounts see the same session history,
-# hook config, plugins, and global instructions. Required for seamless
-# cross-account session resume (-r <session_id>).
-# Only creates symlink if target doesn't exist yet (preserves existing setup).
 link_shared() {
-  local name="$1"
+  local target_dir="$1"
+  local name="$2"
   local src="$HOME/.claude/$name"
-  local dst="$ACCOUNT2_DIR/$name"
-
-  # Source must exist
-  [ ! -e "$src" ] && { echo "  skip $name (source not found)"; return; }
-
-  # If destination exists as real dir/file (not symlink), leave it alone
+  local dst="$target_dir/$name"
+  [ ! -e "$src" ] && { echo "    skip $name (source missing)"; return; }
   if [ -e "$dst" ] && [ ! -L "$dst" ]; then
-    echo "  skip $name (exists in $ACCOUNT2_DIR, not overwriting)"
+    echo "    skip $name (exists, not overwriting)"
     return
   fi
-
-  # If already a symlink to the right target, skip
   if [ -L "$dst" ]; then
-    local current=$(readlink "$dst")
-    [ "$current" = "$src" ] && { echo "  skip $name (already linked)"; return; }
+    [ "$(readlink "$dst")" = "$src" ] && { echo "    skip $name (already linked)"; return; }
     rm -f "$dst"
   fi
-
   ln -s "$src" "$dst"
-  echo "  linked $name"
+  echo "    linked $name"
 }
 
-echo "  Creating symlinks for shared state..."
-link_shared "sessions"      # REQUIRED: -r <session_id> lookup
-link_shared "projects"      # REQUIRED: transcripts
-link_shared "plugins"       # shared plugins (OMC, etc.)
-link_shared "settings.json" # shared hooks and config
-link_shared "scripts"       # hook scripts
-link_shared "CLAUDE.md"     # global instructions (optional)
+# Symlink shared resources for accounts 2..N (account 1 IS ~/.claude)
+for i in $(seq 2 "$NUM_ACCOUNTS"); do
+  d=$(account_dir_for "$i")
+  echo "  $d:"
+  for name in sessions projects plugins settings.json scripts CLAUDE.md; do
+    link_shared "$d" "$name"
+  done
+done
 
+# Final usage display
 echo ""
 echo "=== Installation complete ==="
 echo ""
@@ -271,32 +312,40 @@ if [ "$OS" = "linux" ] && [ -n "${SSH_CONNECTION:-}" ] && [ -z "${DISPLAY:-}" ];
   echo "  Headless server detected."
   echo ""
   echo "  Option A — Copy credentials from local machine:"
-  echo "    # on local machine (after claude login):"
-  echo "    scp ~/.claude/.credentials.json server:~/.claude/.credentials.json"
-  echo "    scp ~/.claude-account2/.credentials.json server:$ACCOUNT2_DIR/.credentials.json"
+  for i in $(seq 1 "$NUM_ACCOUNTS"); do
+    d=$(account_dir_for "$i")
+    echo "    scp <local>:$d/.credentials.json server:$d/.credentials.json"
+  done
   echo ""
-  echo "  Option B — SSH port forwarding for browser OAuth:"
+  echo "  Option B — SSH port forwarding for OAuth flow:"
   echo "    ssh -L 54545:localhost:54545 server"
-  echo "    # then on server: claude login"
-  echo ""
+  for i in $(seq 1 "$NUM_ACCOUNTS"); do
+    d=$(account_dir_for "$i")
+    if [ "$i" = "1" ]; then
+      echo "    claude login                                # account 1"
+    else
+      echo "    CLAUDE_CONFIG_DIR=$d claude login   # account $i"
+    fi
+  done
 else
-  echo "  Account 1:  claude login"
-  echo "  Account 2:  CLAUDE_CONFIG_DIR=$ACCOUNT2_DIR claude login"
-  echo ""
+  for i in $(seq 1 "$NUM_ACCOUNTS"); do
+    d=$(account_dir_for "$i")
+    if [ "$i" = "1" ]; then
+      echo "  Account 1:  claude login"
+    else
+      echo "  Account $i:  CLAUDE_CONFIG_DIR=$d claude login"
+    fi
+  done
 fi
-
+echo ""
 echo "Usage:"
-echo "  $ALIAS_AUTO / $ALIAS_AUTO_R   — auto-pick less-used account (default)"
-echo "  $ALIAS_1 / $ALIAS_1R          — explicit account 1"
-echo "  $ALIAS_2 / $ALIAS_2R          — explicit account 2"
-echo "  $USAGE_ALIAS                  — show both accounts' usage"
-echo "  ccls                          — list tmux sessions"
-echo "  cca                           — attach last tmux session"
+echo "  $ALIAS_AUTO / $ALIAS_AUTO_R   — auto-pick across all accounts"
+for i in $(seq 1 "$NUM_ACCOUNTS"); do
+  echo "  cc${i} / cc${i}r              — explicit account $i"
+done
+echo "  $USAGE_ALIAS                  — show usage for all accounts"
+echo "  ccls / cca                    — list / attach tmux sessions"
 echo ""
-echo "Each invocation opens a tmux window named acct1 or acct2 in"
-echo "a session matching your project (basename of cwd)."
-echo ""
-echo "Rate limit handling is automatic — hook switches to the other account"
-echo "and resumes the same conversation in a new tmux window."
+echo "Rate limit handling is automatic — switches to next available account."
 echo ""
 echo "Restart your shell: source $SHELL_RC"
