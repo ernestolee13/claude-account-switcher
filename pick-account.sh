@@ -12,6 +12,13 @@
 #
 # Cache result for $PICK_CACHE_TTL seconds (default 60) in
 # /tmp/claude_pick_account_cache. Force refresh with `--no-cache`.
+#
+# Flags:
+#   --no-cache  Skip cache read (force fresh probe).
+#   --strict    On no viable candidate, output empty (no "1" fallback).
+#               Used by the rate-limit hook so it can detect
+#               "all-exhausted" properly instead of switching to a
+#               broken account.
 
 set -u
 
@@ -27,8 +34,19 @@ CACHE_FILE="/tmp/claude_pick_account_cache"
 CACHE_TTL="${PICK_CACHE_TTL:-60}"
 COOLDOWN="${CLAUDE_SWITCH_COOLDOWN:-1800}"
 
-# Honor force-refresh flag
-if [ "${1:-}" != "--no-cache" ] && [ -f "$CACHE_FILE" ]; then
+NO_CACHE=0
+STRICT=0
+for arg in "$@"; do
+  case "$arg" in
+    --no-cache) NO_CACHE=1 ;;
+    --strict)   STRICT=1 ;;
+  esac
+done
+
+# Strict mode bypasses cache to avoid serving a cached "1" fallback
+[ "$STRICT" -eq 1 ] && NO_CACHE=1
+
+if [ "$NO_CACHE" -eq 0 ] && [ -f "$CACHE_FILE" ]; then
   CACHE_AGE=$(( $(date +%s) - $(stat -c %Y "$CACHE_FILE" 2>/dev/null || stat -f %m "$CACHE_FILE" 2>/dev/null || echo 0) ))
   if [ "$CACHE_AGE" -lt "$CACHE_TTL" ]; then
     cat "$CACHE_FILE"
@@ -115,7 +133,13 @@ done < <(accounts_list)
 
 CHOICE=""
 if [ "${#CANDIDATES[@]}" -eq 0 ]; then
-  CHOICE="1"
+  # Strict mode: emit empty so callers (the rate-limit hook) can detect
+  # "all exhausted" instead of falling back to a possibly-broken account 1.
+  if [ "$STRICT" -eq 1 ]; then
+    CHOICE=""
+  else
+    CHOICE="1"
+  fi
 elif [ "${#CANDIDATES[@]}" -eq 1 ]; then
   CHOICE="${CANDIDATES[0]%%:*}"
 else
@@ -139,10 +163,12 @@ else
   CHOICE="${BEST_ID:-1}"
 fi
 
-echo "$CHOICE" > "$CACHE_FILE" 2>/dev/null
+# Don't pollute cache with the empty (strict, no-candidates) result —
+# next non-strict caller would otherwise inherit "no choice" and fail.
+[ -n "$CHOICE" ] && echo "$CHOICE" > "$CACHE_FILE" 2>/dev/null
 
 LOG_FILE="$HOME/.claude/logs/account-switch.log"
 mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] pick-account:${DEBUG_INFO} → choice=$CHOICE" >> "$LOG_FILE"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] pick-account:${DEBUG_INFO} → choice=${CHOICE:-<none>} (strict=$STRICT)" >> "$LOG_FILE"
 
 echo "$CHOICE"

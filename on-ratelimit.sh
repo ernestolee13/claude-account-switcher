@@ -71,7 +71,15 @@ fi
 
 [ "$ERROR_TYPE" != "rate_limit" ] && { log "$HOOK_SOURCE: error_type=$ERROR_TYPE (ignored)"; exit 0; }
 
-# Dedup
+NOW=$(date +%s)
+
+# Dedup A: by UUID. Claude Code 2.1.x sometimes fires StopFailure with no
+# UUID at all — synthesize one from session_id + minute bucket so empty-UUID
+# duplicates still get filtered.
+if [ -z "$RL_UUID" ] && [ -n "$SESSION_ID" ]; then
+  RL_UUID="nouuid-${SESSION_ID}-$(date -u +%Y%m%dT%H%M)"
+  log "$HOOK_SOURCE: no UUID in payload; synthesized dedup key: $RL_UUID"
+fi
 SEEN_FILE="/tmp/claude_ratelimit_seen_uuids"
 touch "$SEEN_FILE" 2>/dev/null || true
 if [ -n "$RL_UUID" ] && grep -q "^${RL_UUID}$" "$SEEN_FILE" 2>/dev/null; then
@@ -80,17 +88,34 @@ if [ -n "$RL_UUID" ] && grep -q "^${RL_UUID}$" "$SEEN_FILE" 2>/dev/null; then
 fi
 [ -n "$RL_UUID" ] && echo "$RL_UUID" >> "$SEEN_FILE"
 
+# Dedup B: per-session 60s switch cooldown. When the same Stop event fires
+# twice (e.g., once with synthetic UUID, once with the real UUID) the
+# UUID-only dedup can't catch both — this ensures we never open more than
+# one failover surface per session-minute.
+if [ -n "$SESSION_ID" ]; then
+  LAST_SWITCH_FILE="/tmp/claude_last_switch_${SESSION_ID}"
+  if [ -f "$LAST_SWITCH_FILE" ]; then
+    LAST_TS=$(cat "$LAST_SWITCH_FILE" 2>/dev/null || echo 0)
+    SINCE_LAST=$((NOW - LAST_TS))
+    if [ "$SINCE_LAST" -lt 60 ]; then
+      log "$HOOK_SOURCE: session=$SESSION_ID switched ${SINCE_LAST}s ago (<60s) — skip"
+      exit 0
+    fi
+  fi
+fi
+
 log "=== Rate limit detected (via $HOOK_SOURCE, uuid=$RL_UUID) ==="
 log "Env: CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-default} | CMUX_WORKSPACE_ID=${CMUX_WORKSPACE_ID:-none} | TMUX=${TMUX:-none}"
 
 # --- Config ---
-COOLDOWN="${CLAUDE_SWITCH_COOLDOWN:-1800}"
+# Default 18000s (5h, matches Claude's 5-hour usage window). Used as fallback;
+# the primary recovery signal is the live `resets_at` from /api/oauth/usage.
+COOLDOWN="${CLAUDE_SWITCH_COOLDOWN:-18000}"
 STATE_FILE="/tmp/claude_active_account"
 TMUX_BIN="${TMUX_BIN:-$(command -v tmux 2>/dev/null || echo '')}"
 RESUME_MESSAGE="${CLAUDE_RESUME_MESSAGE:-Rate limit으로 계정이 전환되었습니다. 이전 작업을 이어서 진행해주세요.}"
 
 CURRENT_ID=$(account_current_id)
-NOW=$(date +%s)
 
 # Cross-platform notification
 notify() {
@@ -108,10 +133,19 @@ pick_next_account() {
   local picker="$HOME/.claude/scripts/pick-account.sh"
   if [ -x "$picker" ]; then
     local choice
-    choice=$(bash "$picker" --no-cache 2>/dev/null)
-    [ -n "$choice" ] && [ "$choice" != "$exclude" ] && { echo "$choice"; return; }
+    # --strict: empty stdout means "no viable candidate" (avoid the
+    # default "1" fallback, which would launch claude on a broken /
+    # unauthorized account and silently fail to resume).
+    choice=$(bash "$picker" --strict --no-cache 2>/dev/null)
+    if [ -n "$choice" ] && [ "$choice" != "$exclude" ]; then
+      echo "$choice"; return
+    fi
+    # Trust the strict picker: it actively probed every account and found
+    # none viable. Skip the manifest fallback to let the caller hit the
+    # all-exhausted branch.
+    return
   fi
-  # Fallback: first non-excluded, non-rate-limited account from manifest
+  # Picker missing — fall back to manifest scan (rate-limit timestamps only)
   while read -r id; do
     [ "$id" = "$exclude" ] && continue
     local rl_file="/tmp/claude_ratelimit_account${id}"
@@ -245,6 +279,57 @@ RESUME_EOF
 
 # Mark current account as rate-limited
 echo "$NOW" > "/tmp/claude_ratelimit_account${CURRENT_ID}"
+# Mark per-session switch timestamp now that all dedup gates have passed
+[ -n "$SESSION_ID" ] && echo "$NOW" > "/tmp/claude_last_switch_${SESSION_ID}"
+
+# Query live OAuth usage for an account → "<reset_iso>\t<reset_epoch>" or empty.
+# Used by the all-exhausted branch to wake at the real reset moment instead
+# of a fixed COOLDOWN guess.
+query_resets_at() {
+  local config_dir="$1"
+  local token=""
+  if [ -f "$config_dir/.credentials.json" ]; then
+    token=$(python3 -c "
+import json
+try:
+    d=json.load(open('$config_dir/.credentials.json'))
+    print(d.get('claudeAiOauth',{}).get('accessToken',''))
+except: pass
+" 2>/dev/null)
+  fi
+  if [ -z "$token" ] && command -v security >/dev/null 2>&1; then
+    local service="Claude Code-credentials"
+    if [ "$config_dir" != "$HOME/.claude" ]; then
+      local match
+      match=$(security dump-keychain 2>/dev/null | grep -oE '"Claude Code-credentials-[a-f0-9]+"' | tr -d '"' | head -1)
+      [ -n "$match" ] && service="$match"
+    fi
+    token=$(security find-generic-password -s "$service" -a "$USER" -w 2>/dev/null | python3 -c "
+import json, sys
+try: print(json.load(sys.stdin)['claudeAiOauth']['accessToken'])
+except: pass
+" 2>/dev/null)
+  fi
+  [ -z "$token" ] && return 1
+  local resp
+  resp=$(curl -s --max-time 5 \
+    -H "Authorization: Bearer $token" \
+    -H "Content-Type: application/json" \
+    -H "anthropic-beta: oauth-2025-04-20" \
+    "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
+  [ -z "$resp" ] && return 1
+  echo "$resp" | python3 -c "
+import json, sys, datetime
+try:
+    d=json.load(sys.stdin)
+    if 'error' in d: sys.exit(1)
+    r5=d['five_hour']['resets_at']
+    ts=datetime.datetime.fromisoformat(r5.replace('Z','+00:00')).timestamp()
+    print(f'{r5}\t{int(ts)}')
+except Exception:
+    sys.exit(1)
+" 2>/dev/null
+}
 
 # Find next available account (excluding current)
 NEXT_ID=$(pick_next_account "$CURRENT_ID")
@@ -262,25 +347,52 @@ else
   OLD_PID=$(cat /tmp/claude_resume_pid 2>/dev/null || echo "")
   [ -n "$OLD_PID" ] && kill "$OLD_PID" 2>/dev/null || true
 
-  # Find earliest-rate-limited account (will recover first)
+  # Pick the account that recovers FIRST. Prefer the live `resets_at` from
+  # /api/oauth/usage; fall back to (rate-limit marker + COOLDOWN) for any
+  # account whose API can't be queried (token broken, network down, etc).
   RECOVER_ID=""
-  RECOVER_TIME=$NOW
+  RECOVER_EP=0
+  RECOVER_SOURCE=""
   while read -r id; do
-    rl_file="/tmp/claude_ratelimit_account${id}"
-    [ ! -f "$rl_file" ] && continue
-    ts=$(cat "$rl_file" 2>/dev/null || echo "$NOW")
-    if [ -z "$RECOVER_ID" ] || [ "$ts" -lt "$RECOVER_TIME" ]; then
-      RECOVER_ID="$id"; RECOVER_TIME="$ts"
+    [ -z "$id" ] && continue
+    cfg=$(account_dir "$id")
+    [ -z "$cfg" ] && continue
+    api_out=$(query_resets_at "$cfg" 2>/dev/null || true)
+    if [ -n "$api_out" ]; then
+      reset_iso=$(echo "$api_out" | cut -f1)
+      reset_ep=$(echo "$api_out" | cut -f2)
+      log "API: acct${id} resets_at=${reset_iso}"
+    else
+      # Fallback: use the rate-limit marker + COOLDOWN as estimated reset
+      rl_file="/tmp/claude_ratelimit_account${id}"
+      if [ -f "$rl_file" ]; then
+        ts=$(cat "$rl_file" 2>/dev/null || echo "$NOW")
+        reset_ep=$(( ts + COOLDOWN ))
+        log "API unavailable for acct${id}; marker fallback reset_ep=${reset_ep}"
+      else
+        # No marker, no API → assume just-now + COOLDOWN
+        reset_ep=$(( NOW + COOLDOWN ))
+        log "No data for acct${id}; assumed reset_ep=${reset_ep}"
+      fi
+    fi
+    if [ -z "$RECOVER_ID" ] || [ "$reset_ep" -lt "$RECOVER_EP" ]; then
+      RECOVER_ID="$id"; RECOVER_EP="$reset_ep"
+      RECOVER_SOURCE=$([ -n "$api_out" ] && echo "api" || echo "marker")
     fi
   done < <(account_ids)
 
   RECOVER_ID="${RECOVER_ID:-1}"
-  WAIT_SECS=$(( RECOVER_TIME + COOLDOWN - NOW ))
+  # +30s buffer past the reset moment so the API can serve fresh tokens
+  WAIT_SECS=$(( RECOVER_EP - NOW + 30 ))
   [ "$WAIT_SECS" -lt 60 ] && WAIT_SECS=60
   WAIT_MINS=$(( WAIT_SECS / 60 ))
+  RECOVER_HUMAN=$(date -d "@${RECOVER_EP}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+                 || date -r "${RECOVER_EP}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+                 || echo "epoch=$RECOVER_EP")
+  log "Recover plan: acct${RECOVER_ID} at ${RECOVER_HUMAN} (in ${WAIT_MINS}min, source=${RECOVER_SOURCE})"
 
   echo "$RECOVER_ID" > "$STATE_FILE"
-  notify "All ${HOOK_SOURCE:-} accounts exhausted. Auto-resume in ~${WAIT_MINS}min." "Claude Code"
+  notify "All accounts exhausted. Auto-resume acct${RECOVER_ID} at ${RECOVER_HUMAN} (~${WAIT_MINS}min)." "Claude Code"
 
   RECOVER_CONFIG=$(account_dir "$RECOVER_ID")
   nohup bash -c "
