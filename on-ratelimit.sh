@@ -190,6 +190,17 @@ start_resume_session() {
     return 1
   fi
 
+  # Sync mcpServers across all account .claude.json files. Catches any
+  # newly added MCP entries on the source side and propagates them to the
+  # target before we launch claude there. Falls back to a known-good backup
+  # if all accounts came up empty (defensive against external resets).
+  # Gated on manifest's "sync_mcp_servers" (default true).
+  local sync_script="$HOME/.claude/scripts/lib/sync-mcp-servers.sh"
+  if [ -x "$sync_script" ] && accounts_sync_mcp_enabled; then
+    bash "$sync_script" 2>&1 | sed 's/^/  mcp-sync: /' | tee -a "$LOG_FILE" >/dev/null || \
+      log "WARN: mcp sync failed (non-fatal, continuing)"
+  fi
+
   local cmux_bin="${CMUX_BUNDLED_CLI_PATH:-/Applications/cmux.app/Contents/Resources/bin/cmux}"
   local script="/tmp/claude-resume-$$.sh"
   local msg_file="/tmp/claude-resume-msg-$$.txt"

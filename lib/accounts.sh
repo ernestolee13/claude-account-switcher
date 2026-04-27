@@ -7,8 +7,14 @@
 #   "accounts": [
 #     {"id": 1, "config_dir": "~/.claude", "label": "default"},
 #     {"id": 2, "config_dir": "~/.claude-account2", "label": "secondary"}
-#   ]
+#   ],
+#   "sync_mcp_servers": true
 # }
+#
+# Top-level options:
+#   sync_mcp_servers (bool, default true): mirror mcpServers across all
+#     account .claude.json files at install + before each rate-limit
+#     switch. Set false to keep MCP lists per-account.
 #
 # If the manifest doesn't exist, this helper auto-creates a default
 # 2-account manifest so first-run scripts work without explicit install.
@@ -22,7 +28,8 @@ if [ ! -f "$ACCOUNT_MANIFEST" ]; then
   "accounts": [
     {"id": 1, "config_dir": "$HOME/.claude", "label": "default"},
     {"id": 2, "config_dir": "${CLAUDE_CONFIG_DIR_2:-$HOME/.claude-account2}", "label": "secondary"}
-  ]
+  ],
+  "sync_mcp_servers": true
 }
 EOF
 fi
@@ -71,4 +78,32 @@ account_ids() {
 
 account_count() {
   accounts_list | wc -l | tr -d ' '
+}
+
+# Read a top-level boolean option from the manifest.
+# Returns 0 (true) if the value is true/1, 1 (false) otherwise.
+# Defaults to the second arg ("true" or "false") when key is missing.
+accounts_get_bool() {
+  local key="$1" default="${2:-true}"
+  local val
+  val=$(python3 -c "
+import json
+try:
+    d = json.load(open('$ACCOUNT_MANIFEST'))
+    v = d.get('$key', None)
+    if v is None: print('$default')
+    elif isinstance(v, bool): print('true' if v else 'false')
+    else: print(str(v).lower())
+except Exception:
+    print('$default')
+" 2>/dev/null)
+  case "$val" in
+    true|1|yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Convenience: should we mirror mcpServers across accounts?
+accounts_sync_mcp_enabled() {
+  accounts_get_bool sync_mcp_servers true
 }

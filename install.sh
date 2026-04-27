@@ -15,6 +15,7 @@
 #   ACCOUNT<N>_LABEL     — label for account N (default: "" / "default" / "secondary" / "tertiary" / ...)
 #   ALIAS_AUTO           — auto-pick command name (default: cc)
 #   USAGE_ALIAS          — usage viewer alias (default: claude-usage)
+#   SYNC_MCP_SERVERS     — mirror mcpServers across accounts (default: 1; set 0 to disable)
 
 set -euo pipefail
 
@@ -28,6 +29,11 @@ NUM_ACCOUNTS="${NUM_ACCOUNTS:-2}"
 ALIAS_AUTO="${ALIAS_AUTO:-cc}"
 ALIAS_AUTO_R="${ALIAS_AUTO}r"
 USAGE_ALIAS="${USAGE_ALIAS:-claude-usage}"
+SYNC_MCP_SERVERS="${SYNC_MCP_SERVERS:-1}"
+case "$SYNC_MCP_SERVERS" in
+  1|true|yes|TRUE|YES) SYNC_MCP_BOOL="true" ;;
+  *)                   SYNC_MCP_BOOL="false" ;;
+esac
 
 # Resolve account N's config dir (env override or default pattern)
 account_dir_for() {
@@ -84,7 +90,7 @@ done
 echo ""
 
 # 1. Prerequisites
-echo "[1/6] Checking prerequisites..."
+echo "[1/7] Checking prerequisites..."
 command -v claude >/dev/null 2>&1 || { echo "ERROR: claude not found. Install Claude Code first: https://claude.ai/code"; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "ERROR: jq not found. Install with: $(install_hint jq)"; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "ERROR: python3 not found. Install with: $(install_hint python3)"; exit 1; }
@@ -127,7 +133,7 @@ done
 
 # 2. Generate manifest
 echo ""
-echo "[2/6] Writing account manifest: $ACCOUNT_MANIFEST"
+echo "[2/7] Writing account manifest: $ACCOUNT_MANIFEST"
 {
   echo "{"
   echo '  "accounts": ['
@@ -146,26 +152,28 @@ echo "[2/6] Writing account manifest: $ACCOUNT_MANIFEST"
     [ "$i" = "$NUM_ACCOUNTS" ] && sep=""
     printf '    {"id": %d, "config_dir": "%s", "label": "%s"}%s\n' "$i" "$d" "$l" "$sep"
   done
-  echo "  ]"
+  echo "  ],"
+  printf '  "sync_mcp_servers": %s\n' "$SYNC_MCP_BOOL"
   echo "}"
 } > "$ACCOUNT_MANIFEST"
-echo "  Wrote $NUM_ACCOUNTS accounts"
+echo "  Wrote $NUM_ACCOUNTS accounts (sync_mcp_servers=$SYNC_MCP_BOOL)"
 
 # 3. Copy scripts
 echo ""
-echo "[3/6] Installing scripts to $CLAUDE_SCRIPTS..."
+echo "[3/7] Installing scripts to $CLAUDE_SCRIPTS..."
 mkdir -p "$CLAUDE_SCRIPTS" "$CLAUDE_LIB"
 cp "$SCRIPT_DIR/on-ratelimit.sh" "$CLAUDE_SCRIPTS/on-ratelimit.sh"
 cp "$SCRIPT_DIR/on-stop-ratelimit.sh" "$CLAUDE_SCRIPTS/on-stop-ratelimit.sh"
 cp "$SCRIPT_DIR/claude-usage.sh" "$CLAUDE_SCRIPTS/claude-usage.sh"
 cp "$SCRIPT_DIR/pick-account.sh" "$CLAUDE_SCRIPTS/pick-account.sh"
 cp "$SCRIPT_DIR/lib/accounts.sh" "$CLAUDE_LIB/accounts.sh"
-chmod +x "$CLAUDE_SCRIPTS"/*.sh "$CLAUDE_LIB/accounts.sh"
+cp "$SCRIPT_DIR/lib/sync-mcp-servers.sh" "$CLAUDE_LIB/sync-mcp-servers.sh"
+chmod +x "$CLAUDE_SCRIPTS"/*.sh "$CLAUDE_LIB"/*.sh
 echo "  Done"
 
 # 4. Register hooks
 echo ""
-echo "[4/6] Registering hooks..."
+echo "[4/7] Registering hooks..."
 [ -f "$CLAUDE_SETTINGS" ] || echo '{}' > "$CLAUDE_SETTINGS"
 
 TMPFILE=$(mktemp)
@@ -188,7 +196,7 @@ fi
 
 # 5. Setup shell functions/aliases
 echo ""
-echo "[5/6] Setting up shell functions..."
+echo "[5/7] Setting up shell functions..."
 SHELL_RC=""
 case "${SHELL:-}" in
   */zsh)  SHELL_RC="$HOME/.zshrc" ;;
@@ -271,7 +279,7 @@ fi
 
 # 6. Create config dirs + symlink shared resources for accounts 2+
 echo ""
-echo "[6/6] Setting up config dirs..."
+echo "[6/7] Setting up config dirs..."
 for i in $(seq 1 "$NUM_ACCOUNTS"); do
   d=$(account_dir_for "$i")
   mkdir -p "$d"
@@ -303,6 +311,20 @@ for i in $(seq 2 "$NUM_ACCOUNTS"); do
     link_shared "$d" "$name"
   done
 done
+
+# Mirror mcpServers across all accounts (one-time at install). Future
+# rate-limit switches re-run sync via on-ratelimit.sh, so adding an MCP
+# in any account propagates to the others on the next switch.
+echo ""
+if [ "$SYNC_MCP_BOOL" = "true" ]; then
+  echo "[7/7] Syncing mcpServers across accounts..."
+  bash "$CLAUDE_LIB/sync-mcp-servers.sh" 2>&1 | sed 's/^/  /' || \
+    echo "  (sync skipped — non-fatal)"
+else
+  echo "[7/7] mcpServers sync DISABLED (sync_mcp_servers=false in manifest)"
+  echo "      Each account keeps its own mcpServers list."
+  echo "      To enable later: edit $ACCOUNT_MANIFEST and set \"sync_mcp_servers\": true"
+fi
 
 # Final usage display
 echo ""
