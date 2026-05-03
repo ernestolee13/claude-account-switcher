@@ -165,19 +165,90 @@ start_resume_session() {
 
   [ -z "$target_config" ] && { log "ABORT: cannot resolve config dir for account $target_id"; return 1; }
 
-  # Copy session's history.jsonl entries to target before launching `claude -r`
-  # (target without history fallbacks to onboarding and wipes .claude.json)
+  # Ensure target's history.jsonl has an entry for SESSION_ID so `claude -r`
+  # can find it. Three sources, in order:
+  #
+  #  1. Target already has it → no-op.
+  #  2. Source has it → copy.
+  #  3. Neither has it → synthesize a minimal entry from hook payload
+  #     (SESSION_ID + CWD + TRANSCRIPT_PATH). This handles the race where
+  #     morning-routine's session hits rate_limit and exits before history.jsonl
+  #     is flushed (`projects/` is symlinked between accounts so the transcript
+  #     itself is shared — only the lookup row is missing).
+  #
+  # Without this, `claude -r <missing-id>` falls through to onboarding which
+  # is the "ash 같은 화면" failure mode. With it, the resume actually resumes.
+  local has_session=0
   if [ -n "$SESSION_ID" ]; then
     local src_hist="$source_config/history.jsonl"
     local dst_hist="$target_config/history.jsonl"
-    if [ -f "$src_hist" ]; then
-      local matched
-      matched=$(grep -c "\"sessionId\":\"$SESSION_ID\"" "$src_hist" 2>/dev/null || echo 0)
-      if [ "$matched" -gt 0 ] && ! grep -q "\"sessionId\":\"$SESSION_ID\"" "$dst_hist" 2>/dev/null; then
-        grep "\"sessionId\":\"$SESSION_ID\"" "$src_hist" >> "$dst_hist"
-        log "Copied $matched history.jsonl entries for session=$SESSION_ID: $src_hist → $dst_hist"
+    [ ! -f "$dst_hist" ] && touch "$dst_hist" 2>/dev/null
+
+    # 1+2: target already / source has → copy if needed
+    if [ -f "$src_hist" ] \
+        && grep -q "\"sessionId\":\"$SESSION_ID\"" "$src_hist" 2>/dev/null \
+        && ! grep -q "\"sessionId\":\"$SESSION_ID\"" "$dst_hist" 2>/dev/null; then
+      grep "\"sessionId\":\"$SESSION_ID\"" "$src_hist" >> "$dst_hist"
+      log "Copied history.jsonl entry for session=$SESSION_ID: $src_hist → $dst_hist"
+    fi
+
+    # 3: still missing → synthesize from payload (SESSION_ID + CWD + TRANSCRIPT_PATH).
+    # Read first user message from the transcript for the `display` field;
+    # tolerate missing transcript or non-user first lines.
+    if ! grep -q "\"sessionId\":\"$SESSION_ID\"" "$dst_hist" 2>/dev/null; then
+      local synth
+      synth=$(SESSION_ID="$SESSION_ID" CWD="$CWD" TRANSCRIPT_PATH="$TRANSCRIPT_PATH" python3 -c '
+import json, os, time, sys
+sid = os.environ.get("SESSION_ID","")
+proj = os.environ.get("CWD","") or os.path.expanduser("~")
+tp = os.environ.get("TRANSCRIPT_PATH","")
+display = ""
+if tp and os.path.isfile(tp):
+    try:
+        with open(tp) as f:
+            for line in f:
+                try: e = json.loads(line)
+                except: continue
+                if e.get("type") == "user":
+                    msg = e.get("message", {}) or {}
+                    c = msg.get("content")
+                    if isinstance(c, str): display = c
+                    elif isinstance(c, list):
+                        for blk in c:
+                            if isinstance(blk, dict) and blk.get("type") == "text":
+                                display = blk.get("text",""); break
+                    if display: break
+    except Exception: pass
+display = (display or "")[:200]
+print(json.dumps({
+    "display": display,
+    "pastedContents": {},
+    "timestamp": int(time.time()*1000),
+    "project": proj,
+    "sessionId": sid,
+}, ensure_ascii=False))
+' 2>/dev/null)
+      if [ -n "$synth" ]; then
+        echo "$synth" >> "$dst_hist"
+        # Also seed source history so future hooks don't re-synthesize unnecessarily.
+        [ -f "$src_hist" ] && ! grep -q "\"sessionId\":\"$SESSION_ID\"" "$src_hist" 2>/dev/null && \
+          echo "$synth" >> "$src_hist"
+        log "Synthesized history.jsonl entry for session=$SESSION_ID (source race) → $dst_hist"
+      else
+        log "WARN: failed to synthesize history.jsonl entry for session=$SESSION_ID"
       fi
     fi
+
+    grep -q "\"sessionId\":\"$SESSION_ID\"" "$dst_hist" 2>/dev/null && has_session=1
+  fi
+
+  # Resume command: prefer `-r SESSION_ID` (now reliable thanks to the
+  # synthesis above); only fall back to fresh `claude` as last resort.
+  local resume_cmd
+  if [ "$has_session" -eq 1 ]; then
+    resume_cmd="claude --dangerously-skip-permissions -r $SESSION_ID"
+  else
+    resume_cmd="claude --dangerously-skip-permissions"
   fi
 
   # Safety gate: refuse to launch if target .claude.json is missing/tiny
@@ -223,7 +294,7 @@ if [ -x "\$CMUX_BIN" ] && [ -n "\${CMUX_SURFACE_ID:-}" ] && [ -n "\${CMUX_WORKSP
 else
   echo "[\$(date '+%Y-%m-%d %H:%M:%S')] WARN: auto-resume message skipped (CMUX_SURFACE_ID=\${CMUX_SURFACE_ID:-empty}, MSG_FILE=\$MSG_FILE)" >> "$HOME/.claude/logs/account-switch.log"
 fi
-CLAUDE_CONFIG_DIR=$target_config exec claude --dangerously-skip-permissions -r $SESSION_ID
+CLAUDE_CONFIG_DIR=$target_config exec $resume_cmd
 RESUME_EOF
   chmod +x "$script"
 

@@ -86,7 +86,9 @@ if 'error' in d:
 else:
     h5=d['five_hour']['utilization']
     d7=d['seven_day']['utilization']
-    r5=d['five_hour']['resets_at'][:16].replace('T',' ')
+    # resets_at는 5h util=0%일 때 null → 슬라이싱 TypeError. 7d resets_at으로 폴백, 둘 다 null이면 '—'
+    r_iso=d['five_hour'].get('resets_at') or d['seven_day'].get('resets_at')
+    r5=r_iso[:16].replace('T',' ') if r_iso else '—'
     print(f\"  {'$alias_label':<30} {'$email':<30} 5h {h5:>4.0f}% | 7d {d7:>4.0f}% (resets {r5})\")
 " 2>/dev/null || printf "  %-30s %-30s query failed\n" "$alias_label" "$email"
 }
