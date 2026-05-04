@@ -311,9 +311,18 @@ RESUME_EOF
       new_surface=$(echo "$new_result" | grep -oE "surface:[0-9]+" | head -1)
     fi
     if [ -n "$new_surface" ]; then
-      sleep 2
-      "$cmux_bin" send --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "bash $script" 2>/dev/null || true
-      "$cmux_bin" send-key --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "enter" 2>/dev/null || true
+      # Wait for the new shell to fully initialize. oh-my-zsh's auto-update
+      # `[Y/n]` prompt and other interactive startup prompts (VCS, fzf, etc.)
+      # will eat the first keystroke we send — without this, "bash $script"
+      # becomes "ash $script" because `b` was answered to the prompt.
+      sleep 4
+      # Cancel any pending interactive prompt (Ctrl-C → declines [Y/n] safely;
+      # on a clean prompt it's a no-op new line).
+      "$cmux_bin" send-key --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "ctrl+c" 2>/dev/null || true
+      sleep 1
+      # Clear any residual input on the line, then send the actual command.
+      "$cmux_bin" send-key --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "ctrl+u" 2>/dev/null || true
+      "$cmux_bin" send --surface "$new_surface" --workspace "$CMUX_WORKSPACE_ID" "bash $script\n" 2>/dev/null || true
       log "cmux split-right created: $new_surface with account${target_id} via $script"
       return 0
     fi
